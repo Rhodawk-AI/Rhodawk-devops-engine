@@ -2,7 +2,8 @@ requests
 pytest
 gitpython
 gradio>=4.44.0,<5.0.0
-jinja2>=3.1.4
+jinja2>=3.1.5
+starlette>=0.27.0,<0.38.0
 aider-chat
 ruff
 tenacity
