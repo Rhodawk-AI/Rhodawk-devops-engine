@@ -12,7 +12,9 @@ RUN apt-get update && \
 
 WORKDIR /build
 COPY requirements.txt .
-RUN pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt mcp-server-fetch
+# uv will automatically handle the conflict resolution better than pip
+RUN uv pip install --system --no-cache -r requirements.txt mcp-server-fetch && \
+    pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt mcp-server-fetch
 
 FROM python:3.12-slim AS runtime
 
