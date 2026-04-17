@@ -1055,4 +1055,5 @@ if __name__ == "__main__":
     ui_log("Starting webhook server on port 7861...")
     start_webhook_server()
     ui_log("Webhook server running. Launching dashboard...")
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=False, show_error=True)
+    port = int(os.environ.get("PORT", 7860))
+    demo.launch(server_name="0.0.0.0", server_port=port, share=False, show_error=True)
