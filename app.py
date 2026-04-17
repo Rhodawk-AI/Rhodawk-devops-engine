@@ -1,8 +1,6 @@
 """
 Rhodawk AI — Autonomous DevSecOps Control Plane v3.0
 =====================================================
-The code review monster. No competitor has this capability stack.
-
 Full loop:
   1. Clone repo → discover tests → run pytest
   2. FAIL → retrieve similar fixes from memory (data flywheel)
@@ -68,15 +66,20 @@ from worker_pool import MAX_WORKERS, run_parallel_audit
 # SECRETS — env only, never hardcoded
 # ──────────────────────────────────────────────────────────────
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_REPO = os.getenv("GITHUB_REPO")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "")          # Optional — can be set via chat inbox
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 TENANT_ID = os.getenv("RHODAWK_TENANT_ID", "default")
 MODEL = os.getenv("RHODAWK_MODEL", "openrouter/qwen/qwen-2.5-coder-32b-instruct:free")
 RED_TEAM_ENABLED = os.getenv("RHODAWK_RED_TEAM_ENABLED", "true").lower() != "false"
 
-for _key, _val in [("GITHUB_TOKEN", GITHUB_TOKEN), ("GITHUB_REPO", GITHUB_REPO), ("OPENROUTER_API_KEY", OPENROUTER_API_KEY)]:
+# Only GITHUB_TOKEN and OPENROUTER_API_KEY are truly required at startup.
+# GITHUB_REPO is now optional — it can be supplied via the chat inbox at runtime.
+for _key, _val in [("GITHUB_TOKEN", GITHUB_TOKEN), ("OPENROUTER_API_KEY", OPENROUTER_API_KEY)]:
     if not _val:
-        raise EnvironmentError(f"Required secret '{_key}' is not set. Add it in HuggingFace Space Settings → Secrets.")
+        raise EnvironmentError(
+            f"Required secret '{_key}' is not set. "
+            "Add it in HuggingFace Space Settings → Secrets."
+        )
 
 # ──────────────────────────────────────────────────────────────
 # PATHS & CONSTANTS
@@ -92,6 +95,10 @@ MCP_RUNTIME_CONFIG = "/tmp/mcp_runtime.json"
 dashboard_logs: list[str] = []
 _log_lock = threading.Lock()
 _audit_event = threading.Event()
+
+# Chat inbox state — list of (user_msg, bot_reply) tuples
+_inbox_history: list[tuple[str, str]] = []
+_inbox_lock = threading.Lock()
 
 
 def ui_log(message: str, level: str = "INFO"):
@@ -143,18 +150,40 @@ def run_subprocess_safe(cmd: list, cwd: str = REPO_DIR, timeout: int = 300,
 # GIT HELPERS
 # ──────────────────────────────────────────────────────────────
 def configure_git_credentials():
+    """
+    Set up git credential storage.
+
+    ROOT CAUSE FIX: the previous implementation called
+        git config --global credential.helper 'store --file /tmp/.git-credentials'
+    which writes to $HOME/.gitconfig. In HuggingFace Spaces $HOME=/home/rhodawk
+    is often not writable at container runtime, causing exit-255 (fatal).
+
+    Fix: write the gitconfig file directly — no git subprocess needed —
+    then export GIT_CONFIG_GLOBAL so every subsequent git call in this
+    process picks it up automatically (os.environ is copied by run_subprocess_safe).
+    """
     cred_path = "/tmp/.git-credentials"
     with open(cred_path, "w") as f:
         f.write(f"https://x-token:{GITHUB_TOKEN}@github.com\n")
     os.chmod(cred_path, 0o600)
-    run_subprocess_safe(["git", "config", "--global", "credential.helper", f"store --file {cred_path}"], cwd="/tmp")
+
+    gitconfig_path = "/tmp/.gitconfig"
+    with open(gitconfig_path, "w") as f:
+        f.write(
+            f"[credential]\n\thelper = store --file {cred_path}\n"
+            f"[user]\n\tname = Rhodawk AI\n\temail = agent@rhodawk.ai\n"
+            f"[safe]\n\tdirectory = *\n"
+        )
+    os.chmod(gitconfig_path, 0o600)
+
+    # Export to parent process env — all child subprocesses inherit this
+    os.environ["GIT_CONFIG_GLOBAL"] = gitconfig_path
+    ui_log(f"Git credentials configured → {gitconfig_path}", "INFO")
 
 
 def write_mcp_config() -> str:
     config = {
         "mcpServers": {
-            # @modelcontextprotocol/server-fetch does not exist on npm.
-            # The fetch MCP server is a Python package; invoke via uvx.
             "fetch-docs": {
                 "command": "uvx", "args": ["mcp-server-fetch"],
                 "env": {"FETCH_ALLOWED_DOMAINS": "docs.python.org,pypi.org,docs.github.com,packaging.python.org,peps.python.org,semver.org"}
@@ -218,7 +247,7 @@ def create_github_pr(repo: str, branch: str, test_path: str, token: str) -> str:
         "base": "main",
         "body": (
             "## Rhodawk AI Autonomous Fix\n\n"
-            "This PR was generated autonomously by Rhodawk AI v4.0.\n"
+            "This PR was generated autonomously by Rhodawk AI v3.0.\n"
             "- Tests verified green after fix\n"
             "- SAST gate passed\n"
             "- Supply chain gate passed\n"
@@ -242,7 +271,6 @@ def get_current_diff() -> str:
         diff, _ = run_subprocess_safe(["git", "diff", "HEAD~1", "HEAD", "--unified=3"], cwd=REPO_DIR, raise_on_error=False)
         return diff
     except Exception:
-        # Try working tree diff if no commits yet
         try:
             diff, _ = run_subprocess_safe(["git", "diff", "--unified=3"], cwd=REPO_DIR, raise_on_error=False)
             return diff
@@ -287,7 +315,6 @@ def run_aider(mcp_config_path: str, prompt: str, context_files: list[str]) -> tu
         if mcp_config_path and os.path.exists(mcp_config_path):
             cmd += ["--mcp-config", mcp_config_path]
         cmd += valid
-
         return run_subprocess_safe(cmd, cwd=REPO_DIR, timeout=600,
                                    env_overrides={"OPENROUTER_API_KEY": OPENROUTER_API_KEY},
                                    raise_on_error=False)
@@ -299,7 +326,7 @@ def run_aider(mcp_config_path: str, prompt: str, context_files: list[str]) -> tu
 
 
 # ──────────────────────────────────────────────────────────────
-# THE FULL LOOP — this is the product
+# THE FULL LOOP
 # ──────────────────────────────────────────────────────────────
 def process_failing_test(
     test_path: str,
@@ -308,26 +335,22 @@ def process_failing_test(
     mcp_config_path: str,
     job_id: str,
     branch_name: str,
+    target_repo: str = "",          # ← added: passed from audit loop
 ) -> VerificationResult:
     """
-    The core autonomous healing loop:
+    Core autonomous healing loop:
       memory retrieval → aider fix → test verification → adversarial review
       → SAST gate → supply chain gate → PR open
     Retries up to MAX_RETRIES with accumulating context.
     """
+    repo_ref = target_repo or GITHUB_REPO   # fall back to env var if not supplied
     filename = os.path.basename(test_path)
-    src_file = f"src/{filename.replace('test_', '')}"
+    src_file = test_path.replace("test_", "")
     context_files = [test_path]
-    
-    # E.g., 'agents/test_generator.py' -> 'agents/generator.py'
-    src_file = test_path.replace('test_', '')
-    
-    # Try finding the file in the same directory first
+
     if os.path.exists(os.path.join(REPO_DIR, src_file)):
         context_files.append(src_file)
     else:
-        # Fallback to the src/ directory pattern
-        filename = os.path.basename(test_path)
         fallback_src = f"src/{filename.replace('test_', '')}"
         if os.path.exists(os.path.join(REPO_DIR, fallback_src)):
             src_file = fallback_src
@@ -351,7 +374,7 @@ def process_failing_test(
     for attempt_num in range(1, max_total_attempts + 1):
         ui_log(f"Attempt {attempt_num}/{max_total_attempts}: {test_path}", "RETRY" if attempt_num > 1 else "INFO")
 
-        # ── Step 1: Retrieve similar fixes from memory ──────────
+        # ── Step 1: Retrieve similar fixes ──────────────────────
         try:
             similar_fixes = retrieve_similar_fixes_v2(current_failure, top_k=3)
         except Exception:
@@ -359,7 +382,7 @@ def process_failing_test(
         if similar_fixes:
             ui_log(f"Memory: found {len(similar_fixes)} similar past fix(es) (best similarity: {similar_fixes[0]['similarity']})", "MEM")
 
-        # ── Step 2: Build prompt with memory + retry context ────
+        # ── Step 2: Build prompt ────────────────────────────────
         if attempt_num == 1:
             prompt = build_initial_prompt(test_path, src_file, branch_name, current_failure, similar_fixes)
         else:
@@ -367,7 +390,7 @@ def process_failing_test(
 
         prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:16]
 
-        log_audit_event("AIDER_DISPATCH", job_id, GITHUB_REPO, MODEL, {
+        log_audit_event("AIDER_DISPATCH", job_id, repo_ref, MODEL, {
             "test": test_path, "attempt": attempt_num, "prompt_hash": prompt_hash,
             "memory_hits": len(similar_fixes),
         }, "DISPATCHED")
@@ -377,25 +400,24 @@ def process_failing_test(
 
         if aider_code != 0:
             ui_log(f"Aider non-zero exit on attempt {attempt_num}", "WARN")
-            ui_log(f"AIDER CRASH REASON: {aider_output.strip()[:800]}", "FAIL") # <--- ADD THIS LINE
+            ui_log(f"AIDER CRASH REASON: {aider_output.strip()[:800]}", "FAIL")
             attempt_history.append(VerificationAttempt(
-
                 attempt_number=attempt_num, prompt_hash=prompt_hash,
                 aider_exit_code=aider_code, test_exit_code=-1,
                 test_output="Aider failed to produce output", diff_produced="",
             ))
             record_fix_outcome(current_failure, test_path, "", success=False)
             if attempt_num < max_total_attempts:
-                time.sleep(RETRY_BACKOFF_SECONDS := 5)
+                time.sleep(5)
                 continue
             return VerificationResult(success=False, attempts=attempt_history,
                                       failure_reason=f"Aider failed on all {MAX_RETRIES} attempts")
 
-        # ── Step 4: Get the diff Aider produced ─────────────────
+        # ── Step 4: Get diff ─────────────────────────────────────
         diff_text = get_current_diff()
         changed_files = get_changed_files()
 
-        # ── Step 5: RE-RUN TESTS — close the loop ───────────────
+        # ── Step 5: RE-RUN TESTS ────────────────────────────────
         ui_log(f"Verifying fix — re-running tests (attempt {attempt_num})...", "INFO")
         test_output, test_code = run_subprocess_safe(
             [pytest_bin, test_path, "-v", "--tb=short"], cwd=REPO_DIR, timeout=120, raise_on_error=False
@@ -411,7 +433,7 @@ def process_failing_test(
         # ── Step 6: SAST gate ────────────────────────────────────
         ui_log("Running SAST gate on AI diff...", "SAST")
         sast_report = run_sast_gate(diff_text, changed_files, REPO_DIR)
-        log_audit_event("SAST_SCAN", job_id, GITHUB_REPO, MODEL, {
+        log_audit_event("SAST_SCAN", job_id, repo_ref, MODEL, {
             "attempt": attempt_num, "passed": sast_report.passed,
             "findings": len(sast_report.findings), "blocked_reason": sast_report.blocked_reason,
         }, "PASSED" if sast_report.passed else "BLOCKED")
@@ -420,18 +442,17 @@ def process_failing_test(
             ui_log(f"SAST BLOCKED: {sast_report.blocked_reason}", "SAST")
             notify_sast_blocked(test_path, sast_report.blocked_reason)
             record_fix_outcome(current_failure, test_path, diff_text, success=False)
-            # Revert and retry with SAST failure as context
             run_subprocess_safe(["git", "checkout", "."], cwd=REPO_DIR, raise_on_error=False)
             current_failure = f"Previous fix was SAST-blocked: {sast_report.blocked_reason}\n\nOriginal failure:\n{initial_failure}"
             if attempt_num < max_total_attempts:
                 continue
             return VerificationResult(success=False, attempts=attempt_history,
-                                      failure_reason=f"SAST gate blocked all attempts")
+                                      failure_reason="SAST gate blocked all attempts")
 
         # ── Step 7: Supply chain gate ────────────────────────────
         ui_log("Running supply chain gate...", "SUPPLY")
         sc_report = run_supply_chain_gate(diff_text, REPO_DIR)
-        log_audit_event("SUPPLY_CHAIN_SCAN", job_id, GITHUB_REPO, MODEL, {
+        log_audit_event("SUPPLY_CHAIN_SCAN", job_id, repo_ref, MODEL, {
             "attempt": attempt_num, "passed": sc_report.passed,
             "new_packages": sc_report.new_packages, "blocked_reason": sc_report.blocked_reason,
         }, "PASSED" if sc_report.passed else "BLOCKED")
@@ -443,14 +464,14 @@ def process_failing_test(
             if attempt_num < max_total_attempts:
                 continue
             return VerificationResult(success=False, attempts=attempt_history,
-                                      failure_reason=f"Supply chain gate blocked all attempts")
+                                      failure_reason="Supply chain gate blocked all attempts")
 
         # ── Step 8: ADVERSARIAL LLM REVIEW ──────────────────────
         ui_log("Dispatching adversarial reviewer (red team)...", "ADV")
-        adv_review = run_adversarial_review(diff_text, test_path, initial_failure, GITHUB_REPO)
+        adv_review = run_adversarial_review(diff_text, test_path, initial_failure, repo_ref)
         verdict = adv_review.get("verdict", "CONDITIONAL")
 
-        log_audit_event("ADVERSARIAL_REVIEW", job_id, GITHUB_REPO, MODEL, {
+        log_audit_event("ADVERSARIAL_REVIEW", job_id, repo_ref, MODEL, {
             "attempt": attempt_num, "verdict": verdict,
             "model": adv_review.get("model_used"), "review_hash": adv_review.get("review_hash"),
             "critical_issues": adv_review.get("critical_issues", []),
@@ -465,11 +486,8 @@ def process_failing_test(
             ui_log(f"ADVERSARIAL REJECTED: {adv_review.get('summary', '')}", "ADV")
             for issue in adv_review.get("critical_issues", []):
                 ui_log(f"  Critical: {issue}", "ADV")
-
             record_fix_outcome(current_failure, test_path, diff_text, success=False)
             run_subprocess_safe(["git", "checkout", "."], cwd=REPO_DIR, raise_on_error=False)
-
-            # Inject adversary critique into next attempt
             critique = adv_review.get("retry_guidance", "")
             issues = "\n".join(adv_review.get("critical_issues", []))
             current_failure = (
@@ -485,7 +503,7 @@ def process_failing_test(
 
         # ── Step 9: Check if tests pass ──────────────────────────
         if test_code != 0:
-            ui_log(f"Tests still failing after attempt {attempt_num}. Retrying with new context...", "RETRY")
+            ui_log(f"Tests still failing after attempt {attempt_num}. Retrying...", "RETRY")
             record_fix_outcome(current_failure, test_path, diff_text, success=False)
             current_failure = (
                 f"Attempt {attempt_num} fix did not solve the problem.\n"
@@ -504,7 +522,6 @@ def process_failing_test(
         ensure_fix_committed(test_path)
         diff_text = get_current_diff()
         record_fix_outcome(current_failure, test_path, diff_text, success=True)
-
         return VerificationResult(
             success=True, attempts=attempt_history,
             final_diff=diff_text, final_test_output=test_output,
@@ -557,7 +574,10 @@ def process_audit_test(
     notify_test_failed(test_path)
     log_audit_event("TEST_FAIL", job_id, target_repo, MODEL, {"test": test_path}, "FAILED")
 
-    result = process_failing_test(test_path, initial_output, pytest_bin, mcp_config_path, job_id, branch_name)
+    result = process_failing_test(
+        test_path, initial_output, pytest_bin, mcp_config_path,
+        job_id, branch_name, target_repo=target_repo,
+    )
 
     attempt_id = record_attempt(
         tenant_id, target_repo, test_path, initial_output, MODEL,
@@ -583,7 +603,8 @@ def process_audit_test(
             notify_pr_created(test_path, pr_url)
         ui_log(f"PR submitted for {test_path} (healed in {result.total_attempts} attempt(s))", "PR")
         log_audit_event("PR_SUBMITTED", job_id, target_repo, MODEL,
-                        {"test": test_path, "attempts": result.total_attempts, "branch": branch_name, "pr_url": pr_url}, "SUCCESS")
+                        {"test": test_path, "attempts": result.total_attempts,
+                         "branch": branch_name, "pr_url": pr_url}, "SUCCESS")
         run_subprocess_safe(["git", "checkout", "main"], cwd=REPO_DIR, raise_on_error=False)
         safe_git_pull()
         return {"success": True, "pr_url": pr_url}
@@ -601,6 +622,11 @@ def process_audit_test(
 
 def enterprise_audit_loop(repo_override: str = None, branch: str = "main", specific_test: str = None):
     target_repo = repo_override or GITHUB_REPO
+    if not target_repo:
+        ui_log("No target repo configured. Enter one in the chat inbox or set GITHUB_REPO.", "FAIL")
+        _audit_event.clear()
+        return
+
     ui_log("═" * 70)
     ui_log(f"AUDIT START — Tenant: {TENANT_ID} | Repo: {target_repo} | Model: {MODEL}")
     notify_audit_start(target_repo)
@@ -614,8 +640,6 @@ def enterprise_audit_loop(repo_override: str = None, branch: str = "main", speci
         if not os.path.exists(REPO_DIR):
             ui_log("Cloning repository...")
             Repo.clone_from(f"https://github.com/{target_repo}.git", REPO_DIR)
-            run_subprocess_safe(["git", "config", "user.name", "Rhodawk AI"], cwd=REPO_DIR)
-            run_subprocess_safe(["git", "config", "user.email", "agent@rhodawk.ai"], cwd=REPO_DIR)
         else:
             ui_log("Syncing to latest origin/main...")
             safe_git_pull()
@@ -629,14 +653,11 @@ def enterprise_audit_loop(repo_override: str = None, branch: str = "main", speci
 
         ui_log(f"Discovered {len(test_files)} test file(s).")
 
-        relative_tests = [os.path.relpath(test_path, REPO_DIR) for test_path in test_files]
+        relative_tests = [os.path.relpath(t, REPO_DIR) for t in test_files]
         pool_result = run_parallel_audit(
-            relative_tests,
-            process_audit_test,
-            pytest_bin=pytest_bin,
-            mcp_config_path=mcp_config_path,
-            tenant_id=TENANT_ID,
-            target_repo=target_repo,
+            relative_tests, process_audit_test,
+            pytest_bin=pytest_bin, mcp_config_path=mcp_config_path,
+            tenant_id=TENANT_ID, target_repo=target_repo,
         )
         ui_log(
             f"Worker pool complete — workers={MAX_WORKERS}, healed={pool_result['healed']}, "
@@ -644,18 +665,15 @@ def enterprise_audit_loop(repo_override: str = None, branch: str = "main", speci
             "POOL",
         )
 
-        all_green = True
-        for relative_test in relative_tests:
-            status = get_job_status_enum(TENANT_ID, target_repo, relative_test)
-            if status != JobStatus.DONE:
-                all_green = False
-                break
+        all_green = all(
+            get_job_status_enum(TENANT_ID, target_repo, t) == JobStatus.DONE
+            for t in relative_tests
+        )
 
         if all_green and RED_TEAM_ENABLED and relative_tests:
             ui_log("All tests GREEN — activating Red Team CEGIS.", "RED")
             run_red_team_cegis(
-                repo_dir=REPO_DIR,
-                pytest_bin=pytest_bin,
+                repo_dir=REPO_DIR, pytest_bin=pytest_bin,
                 mcp_config_path=mcp_config_path,
                 blue_team_fn=process_failing_test,
                 tenant_id=TENANT_ID,
@@ -679,26 +697,98 @@ def enterprise_audit_loop(repo_override: str = None, branch: str = "main", speci
     notify_chain_integrity(is_valid, integrity_msg)
 
     ui_log("═" * 70)
-    ui_log(f"AUDIT COMPLETE — Fix success rate: {training_stats['fix_success_rate']} | "
-           f"SAST blocks: {training_stats['sast_blocked']} | "
-           f"Adversarial rejects: {training_stats['adversarially_rejected']} | "
-           f"Patterns learned: {training_stats['patterns_learned']}")
+    ui_log(
+        f"AUDIT COMPLETE — Fix success rate: {training_stats['fix_success_rate']} | "
+        f"SAST blocks: {training_stats['sast_blocked']} | "
+        f"Adversarial rejects: {training_stats['adversarially_rejected']} | "
+        f"Patterns learned: {training_stats['patterns_learned']}"
+    )
     log_audit_event("AUDIT_COMPLETE", "orchestrator", target_repo, MODEL,
                     {**final_metrics, **training_stats}, "COMPLETE")
 
-
-def trigger_audit_fn():
-    if _audit_event.is_set():
-        return "⚠️ Audit already running."
-    if not _audit_event.is_set():
-        _audit_event.set()
-        threading.Thread(target=enterprise_audit_loop, daemon=True).start()
-        return "🚀 Audit triggered — full healing loop deployed."
-    return "⚠️ Audit already running."
+    # Update chat inbox with completion notice
+    with _inbox_lock:
+        m = final_metrics
+        _inbox_history.append((
+            f"✅ Audit complete: `{target_repo}`",
+            f"**Audit finished.**\n"
+            f"- Tests scanned: {m['total']}\n"
+            f"- Verified green: {m['done']}\n"
+            f"- PRs generated: {m['prs_created']}\n"
+            f"- SAST blocked: {m['sast_blocked']}\n"
+            f"- Fix rate: {training_stats['fix_success_rate']}"
+        ))
 
 
 # ──────────────────────────────────────────────────────────────
-# REGISTER WEBHOOK DISPATCHER
+# CHAT INBOX — target repo input
+# ──────────────────────────────────────────────────────────────
+def submit_repo_audit(repo_input: str, chat_history: list) -> tuple[list, str]:
+    """
+    Called when user submits a repo via the chat inbox.
+    Validates, kicks off the audit in a background thread, and
+    returns an updated chat history.
+    """
+    repo = (repo_input or "").strip()
+
+    if not repo:
+        return chat_history + [
+            {"role": "user",    "content": "(empty)"},
+            {"role": "assistant", "content": "⚠️ Please enter a repository in the format `owner/repo`."},
+        ], ""
+
+    if "/" not in repo or len(repo.split("/")) != 2:
+        return chat_history + [
+            {"role": "user",    "content": repo},
+            {"role": "assistant", "content": f'❌ Invalid format: `{repo}`\nUse `owner/repo` — e.g. `MogasalaHemagiri/Multi-Agent-Code-Stabilizer`'},
+        ], repo
+
+    if _audit_event.is_set():
+        return chat_history + [
+            {"role": "user",    "content": repo},
+            {"role": "assistant", "content": "⚠️ An audit is already running. Please wait for it to complete before submitting another repo."},
+        ], ""
+
+    _audit_event.set()
+    threading.Thread(
+        target=enterprise_audit_loop,
+        kwargs={"repo_override": repo},
+        daemon=True,
+    ).start()
+
+    return chat_history + [
+        {"role": "user",    "content": f"🎯 Audit: `{repo}`"},
+        {"role": "assistant", "content": (
+            f"🚀 **Audit started for `{repo}`**\n\n"
+            f"Watch the **Live Agent Log** below for real-time progress.\n"
+            f"I'll post results here when the audit completes.\n\n"
+            f"_Model: `{MODEL}` · Tenant: `{TENANT_ID}`_"
+        )},
+    ], ""
+
+
+def get_inbox_history() -> list:
+    """Pull any background-posted messages (e.g. audit-complete) into the chat."""
+    with _inbox_lock:
+        msgs = [{"role": "assistant", "content": f"**{u}**\n{b}"}
+                for u, b in _inbox_history]
+        _inbox_history.clear()
+    return msgs or []
+
+
+def trigger_audit_fn():
+    """Legacy button handler — uses GITHUB_REPO env var if set."""
+    if not GITHUB_REPO:
+        return "⚠️ No GITHUB_REPO env var set. Use the chat inbox above to enter a repo."
+    if _audit_event.is_set():
+        return "⚠️ Audit already running."
+    _audit_event.set()
+    threading.Thread(target=enterprise_audit_loop, daemon=True).start()
+    return f"🚀 Audit triggered for `{GITHUB_REPO}` — full healing loop deployed."
+
+
+# ──────────────────────────────────────────────────────────────
+# WEBHOOK DISPATCHER
 # ──────────────────────────────────────────────────────────────
 def _webhook_dispatch(**kwargs):
     if not _audit_event.is_set():
@@ -784,8 +874,16 @@ def get_webhook_log_display() -> str:
     from webhook_server import get_webhook_log
     events = get_webhook_log(30)
     if not events:
-        return f"No webhook events yet.\n\nWebhook endpoint: POST http://this-space:7861/webhook/github\nHealth check: GET http://this-space:7861/webhook/health"
-    lines = [f"[{e['timestamp']}] {e['event_type']:20s} | {e['status']:8s} | {e.get('repo','')} | {e.get('detail','')}" for e in events]
+        return (
+            "No webhook events yet.\n\n"
+            "Webhook endpoint: POST http://this-space:7861/webhook/github\n"
+            "Health check:     GET  http://this-space:7861/webhook/health"
+        )
+    lines = [
+        f"[{e['timestamp']}] {e['event_type']:20s} | {e['status']:8s} | "
+        f"{e.get('repo','')} | {e.get('detail','')}"
+        for e in events
+    ]
     return "\n".join(lines)
 
 
@@ -811,7 +909,6 @@ def trigger_swebench_eval(max_instances: int = 25) -> str:
             )
         except Exception as e:
             ui_log(f"SWE-bench eval failed: {e}", "BENCH")
-
     threading.Thread(target=_run, daemon=True).start()
     return f"🧪 SWE-bench Verified evaluation started for {int(max_instances)} instance(s)."
 
@@ -881,23 +978,81 @@ with gr.Blocks(theme=THEME, title="Rhodawk AI — Code Review Monster") as demo:
 
         # ── TAB 1: LIVE OPERATIONS ──────────────────────────────
         with gr.Tab("⚡ Live Operations"):
+
+            # ── STATUS BAR ──────────────────────────────────────
             with gr.Row():
                 stat_status = gr.Textbox(label="System Status", interactive=False, scale=3)
-                stat_total = gr.Number(label="Tests Scanned", interactive=False)
-                stat_done = gr.Number(label="Verified Green", interactive=False)
-                stat_prs = gr.Number(label="PRs Generated", interactive=False)
-                stat_failed = gr.Number(label="Failed", interactive=False)
-                stat_sast = gr.Number(label="SAST Blocked", interactive=False)
+                stat_total  = gr.Number(label="Tests Scanned",  interactive=False)
+                stat_done   = gr.Number(label="Verified Green", interactive=False)
+                stat_prs    = gr.Number(label="PRs Generated",  interactive=False)
+                stat_failed = gr.Number(label="Failed",         interactive=False)
+                stat_sast   = gr.Number(label="SAST Blocked",   interactive=False)
+
+            # ── CHAT INBOX ──────────────────────────────────────
+            gr.HTML("""
+            <div style="margin:20px 0 8px 0; padding:12px 16px;
+                        background:#0f0f1a; border:1px solid #2d2d44;
+                        border-radius:10px;">
+              <span style="font-size:0.85rem; font-weight:700;
+                           color:#7c3aed; letter-spacing:0.06em;
+                           text-transform:uppercase;">
+                🎯 Audit Inbox
+              </span>
+              <span style="font-size:0.78rem; color:#475569; margin-left:10px;">
+                Enter a GitHub repo below to launch a full autonomous healing audit
+              </span>
+            </div>
+            """)
+
+            inbox_chatbot = gr.Chatbot(
+                label="",
+                height=240,
+                bubble_full_width=False,
+                type="messages",
+                show_label=False,
+                container=True,
+                placeholder=(
+                    "<div style='text-align:center; padding:40px 0; color:#475569;'>"
+                    "No audits yet. Enter a repo below and press <b>Run Audit</b>."
+                    "</div>"
+                ),
+            )
 
             with gr.Row():
-                btn_audit = gr.Button("🚀 Trigger Full Healing Audit", variant="primary", scale=3)
+                repo_textbox = gr.Textbox(
+                    placeholder="owner/repo  (e.g. MogasalaHemagiri/Multi-Agent-Code-Stabilizer)",
+                    show_label=False,
+                    scale=5,
+                    lines=1,
+                    max_lines=1,
+                    container=False,
+                )
+                run_btn = gr.Button("🚀 Run Audit", variant="primary", scale=1, min_width=120)
+
+            run_btn.click(
+                submit_repo_audit,
+                inputs=[repo_textbox, inbox_chatbot],
+                outputs=[inbox_chatbot, repo_textbox],
+            )
+            repo_textbox.submit(
+                submit_repo_audit,
+                inputs=[repo_textbox, inbox_chatbot],
+                outputs=[inbox_chatbot, repo_textbox],
+            )
+
+            gr.HTML("<div style='height:4px;'></div>")
+
+            # ── LEGACY TRIGGER ROW (uses GITHUB_REPO env if set) ─
+            with gr.Row():
+                btn_audit = gr.Button("🚀 Trigger Full Healing Audit (env GITHUB_REPO)", variant="secondary", scale=3)
                 btn_reset = gr.Button("🗑 Reset Queue", variant="secondary", scale=1)
 
             trigger_out = gr.Textbox(label="", interactive=False, show_label=False)
-            live_logs = gr.TextArea(label="Live Agent Execution Log", lines=26, interactive=False)
-
             btn_audit.click(trigger_audit_fn, outputs=trigger_out)
             btn_reset.click(reset_queue, outputs=trigger_out)
+
+            # ── LIVE LOG ─────────────────────────────────────────
+            live_logs = gr.TextArea(label="Live Agent Execution Log", lines=26, interactive=False)
 
         # ── TAB 2: JOB QUEUE ───────────────────────────────────
         with gr.Tab("📋 Job Queue"):
@@ -921,30 +1076,24 @@ with gr.Blocks(theme=THEME, title="Rhodawk AI — Code Review Monster") as demo:
                 outputs=[chain_status, audit_log]
             )
 
-        # ── TAB 4: TRAINING DATA & FLYWHEEL ───────────────────
+        # ── TAB 4: DATA FLYWHEEL ───────────────────────────────
         with gr.Tab("🧠 Data Flywheel"):
             gr.Markdown(
                 "### Proprietary training data pipeline\n"
                 "Every `(failure, fix, adversarial_verdict, test_result)` tuple is stored. "
-                "This is the compounding advantage — the system gets smarter with every run. "
                 "Export as HuggingFace-compatible JSONL for model fine-tuning."
             )
-            stats_display = gr.TextArea(label="Flywheel Statistics", lines=12, interactive=False)
+            stats_display   = gr.TextArea(label="Flywheel Statistics",        lines=12, interactive=False)
             training_export = gr.TextArea(label="Training Data Export (JSONL)", lines=14, interactive=False)
-
             with gr.Row():
-                gr.Button("📊 Refresh Stats", variant="secondary").click(get_training_stats_display, outputs=stats_display)
-                gr.Button("⬇ Export JSONL", variant="secondary").click(get_training_export, outputs=training_export)
+                gr.Button("📊 Refresh Stats",  variant="secondary").click(get_training_stats_display, outputs=stats_display)
+                gr.Button("⬇ Export JSONL",    variant="secondary").click(get_training_export,        outputs=training_export)
 
         # ── TAB 5: WEBHOOKS ────────────────────────────────────
         with gr.Tab("🔗 Webhooks"):
             gr.Markdown(f"""
 ### Event-Driven Trigger Server (Port 7861)
 
-Rhodawk accepts real-time events from GitHub, CI systems, and any HTTP client.
-Configure your GitHub repo to send webhooks here and every push/failure triggers an autonomous healing job.
-
-**Endpoints:**
 ```
 POST /webhook/github    — GitHub push/check_run events (HMAC-SHA256 validated)
 POST /webhook/ci        — Generic CI failure: {{"repo": "owner/repo", "test_path": "tests/..."}}
@@ -952,16 +1101,11 @@ POST /webhook/trigger   — Manual trigger
 GET  /webhook/health    — Liveness probe
 GET  /webhook/queue     — Current job status (JSON)
 ```
-
-**GitHub Setup:**
-1. Go to your repo → Settings → Webhooks → Add webhook
-2. URL: `https://your-space.hf.space:7861/webhook/github`
-3. Secret: set `RHODAWK_WEBHOOK_SECRET` in Space secrets  
-4. Events: push, check_run, status
             """)
             webhook_log = gr.TextArea(label="Webhook Event Log", lines=15, interactive=False)
             gr.Button("🔄 Refresh", variant="secondary").click(get_webhook_log_display, outputs=webhook_log)
 
+        # ── TAB 6: RED TEAM ────────────────────────────────────
         with gr.Tab("⚔️ Red Team"):
             gr.Markdown(
                 "### Autonomous Red Team CEGIS\n"
@@ -971,27 +1115,29 @@ GET  /webhook/queue     — Current job status (JSON)
             red_team_box = gr.TextArea(label="Red Team Stats & Logs", lines=22, interactive=False)
             gr.Button("🔄 Refresh Red Team Stats", variant="secondary").click(get_red_team_display, outputs=red_team_box)
 
+        # ── TAB 7: SWE-BENCH ──────────────────────────────────
         with gr.Tab("🧪 SWE-bench"):
             gr.Markdown("### SWE-bench Verified Evaluation")
             with gr.Row():
-                swebench_count = gr.Number(label="Max instances", value=25, precision=0)
-                swebench_start = gr.Button("Start Evaluation", variant="primary")
-                swebench_refresh = gr.Button("Refresh Report", variant="secondary")
+                swebench_count   = gr.Number(label="Max instances", value=25, precision=0)
+                swebench_start   = gr.Button("Start Evaluation",  variant="primary")
+                swebench_refresh = gr.Button("Refresh Report",     variant="secondary")
             swebench_status = gr.Textbox(label="Status", interactive=False)
             swebench_report = gr.TextArea(label="SWE-bench Report", lines=24, interactive=False)
             swebench_start.click(trigger_swebench_eval, inputs=swebench_count, outputs=swebench_status)
             swebench_refresh.click(get_swebench_display, outputs=swebench_report)
 
-        # ── TAB 8: SYSTEM / ARCHITECTURE ──────────────────────
+        # ── TAB 8: ARCHITECTURE ───────────────────────────────
         with gr.Tab("ℹ️ Architecture"):
             compliance_out = gr.Textbox(label="Compliance Export", interactive=False)
             gr.Button("Export SOC 2 Evidence Summary", variant="secondary").click(
                 export_compliance_display, outputs=compliance_out
             )
             gr.Markdown(f"""
-### Rhodawk AI v4.0 — Capability Stack
+### Rhodawk AI v3.0 — Capability Stack
 
-**Tenant:** `{TENANT_ID}` | **Target:** `{GITHUB_REPO}` | **Model:** `{MODEL}`
+**Tenant:** `{TENANT_ID}` | **Model:** `{MODEL}`
+> Target repo is supplied at runtime via the **Audit Inbox** chat input (no restart required).
 
 ---
 
@@ -1014,15 +1160,11 @@ GET  /webhook/queue     — Current job status (JSON)
 
 ---
 
-### What no competitor has (combined)
-
-1. **Closed verification loop** — generates fix, re-runs tests, retries with new context up to {MAX_RETRIES}x
-2. **Adversarial LLM review** — autonomous red-team pass on every AI-generated diff before PR
-3. **Fix memory flywheel** — TF-IDF retrieval of similar past fixes injected as few-shot examples
-4. **Supply chain attack detection** — typosquatting + CVE scan on AI-added packages
-5. **Event-driven webhook triggers** — real-time CI/CD participant, not a manual tool
-6. **Structured training data pipeline** — every run accumulates fine-tuning signal
-7. **Red Team CEGIS** — all-green repos are attacked, fuzzed, and patched autonomously
+### Git Credential Fix (v3.0)
+The previous `git config --global credential.helper ...` call failed with **exit 255**
+in HuggingFace Spaces because `$HOME/.gitconfig` is not writable at runtime.
+Fix: `configure_git_credentials()` now writes `/tmp/.gitconfig` directly and sets
+`GIT_CONFIG_GLOBAL=/tmp/.gitconfig` in `os.environ` so every child subprocess inherits it.
 
 ---
 
@@ -1036,18 +1178,18 @@ GET  /webhook/queue     — Current job status (JSON)
 
     # ── AUTO-REFRESH ────────────────────────────────────────────
     timer = gr.Timer(3)
-    timer.tick(get_live_logs, outputs=live_logs)
+    timer.tick(get_live_logs,   outputs=live_logs)
     timer.tick(get_metrics_row, outputs=[stat_status, stat_total, stat_done, stat_prs, stat_failed, stat_sast])
 
-    demo.load(get_live_logs, outputs=live_logs)
-    demo.load(get_metrics_row, outputs=[stat_status, stat_total, stat_done, stat_prs, stat_failed, stat_sast])
-    demo.load(get_job_table, outputs=job_table)
-    demo.load(get_audit_display, outputs=audit_log)
+    demo.load(get_live_logs,            outputs=live_logs)
+    demo.load(get_metrics_row,          outputs=[stat_status, stat_total, stat_done, stat_prs, stat_failed, stat_sast])
+    demo.load(get_job_table,            outputs=job_table)
+    demo.load(get_audit_display,        outputs=audit_log)
     demo.load(get_chain_integrity_display, outputs=chain_status)
-    demo.load(get_training_stats_display, outputs=stats_display)
-    demo.load(get_webhook_log_display, outputs=webhook_log)
-    demo.load(get_red_team_display, outputs=red_team_box)
-    demo.load(get_swebench_display, outputs=swebench_report)
+    demo.load(get_training_stats_display,  outputs=stats_display)
+    demo.load(get_webhook_log_display,  outputs=webhook_log)
+    demo.load(get_red_team_display,     outputs=red_team_box)
+    demo.load(get_swebench_display,     outputs=swebench_report)
 
 
 if __name__ == "__main__":
