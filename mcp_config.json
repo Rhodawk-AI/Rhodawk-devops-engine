@@ -1,0 +1,27 @@
+{
+  "_comment": [
+    "TEMPLATE ONLY — contains NO secrets.",
+    "Actual runtime config is written to /tmp/mcp_runtime.json at startup.",
+    "FETCH_ALLOWED_DOMAINS prevents SSRF against internal services.",
+    "GITHUB_PERSONAL_ACCESS_TOKEN is injected from env at runtime — never committed.",
+    "NOTE: @modelcontextprotocol/server-fetch does not exist on npm.",
+    "      The fetch MCP server is a Python package (mcp-server-fetch on PyPI).",
+    "      It is installed via uv in the Dockerfile and invoked with `uvx mcp-server-fetch`."
+  ],
+  "mcpServers": {
+    "fetch-docs": {
+      "command": "uvx",
+      "args": ["mcp-server-fetch"],
+      "env": {
+        "FETCH_ALLOWED_DOMAINS": "docs.python.org,pypi.org,docs.github.com,packaging.python.org,peps.python.org"
+      }
+    },
+    "github-manager": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "__INJECTED_BY_APP_AT_RUNTIME__"
+      }
+    }
+  }
+}
