@@ -8,16 +8,17 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends git curl ca-certificates build-essential && \
     rm -rf /var/lib/apt/lists/*
 
-# Install uv for fast conflict resolution
+# Install uv for fast, conflict-free resolution
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
     mv /root/.local/bin/uv /usr/local/bin/uv
 
 WORKDIR /build
 COPY requirements.txt .
 
-# FIX: Use uv to resolve the conflict first, then use pip to build wheels.
-# This ensures aider-chat>=0.86.0 is selected to avoid the requests==2.30.0 error.
-RUN uv pip install --no-cache --system "aider-chat>=0.86.0" && \
+# FIX: Use uv to resolve the entire requirements tree at once.
+# This prevents the "ResolutionImpossible" error by finding the 
+# valid intersection between Gradio 5 and Aider-chat.
+RUN uv pip install --no-cache --system -r requirements.txt mcp-server-fetch && \
     pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt mcp-server-fetch
 
 # Stage 2: Runtime
@@ -38,7 +39,7 @@ RUN apt-get update && \
 
 RUN npm install -g --quiet @modelcontextprotocol/server-github
 
-# Hugging Face UID 1000 Handling
+# Fix: Hugging Face UID 1000 handling
 RUN id -u 1000 >/dev/null 2>&1 && (userdel -r $(id -un 1000) || true) || true && \
     useradd -m -u 1000 -s /bin/bash rhodawk
 
@@ -46,13 +47,13 @@ RUN mkdir -p /data /app && chown -R rhodawk:rhodawk /data /app
 
 WORKDIR /app
 
-# Copy wheels from builder and install them
+# Copy pre-built wheels from builder
 COPY --from=builder /wheels /wheels
 RUN pip install --no-cache-dir /wheels/* && rm -rf /wheels
 
 USER rhodawk
 
-# Copy the rest of your files (including mcp_config.json)
+# Copy the source code
 COPY --chown=rhodawk:rhodawk . .
 
 EXPOSE 7860
