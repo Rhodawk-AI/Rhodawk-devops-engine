@@ -21,6 +21,7 @@ COPY requirements.txt .
 RUN uv pip install --no-cache --system -r requirements.txt mcp-server-fetch && \
     pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt mcp-server-fetch
 
+
 # Stage 2: Runtime
 FROM python:3.12-slim AS runtime
 
@@ -49,6 +50,10 @@ WORKDIR /app
 
 # Copy pre-built wheels from builder
 COPY --from=builder /wheels /wheels
+
+# ADDED FIX: Copy the uv executable from the builder stage
+COPY --from=builder /usr/local/bin/uv /usr/local/bin/uv
+
 RUN pip install --no-cache-dir /wheels/* && rm -rf /wheels
 
 USER rhodawk
