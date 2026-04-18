@@ -752,20 +752,17 @@ def submit_repo_audit(repo_input: str, chat_history: list) -> tuple[list, str]:
 
     if not repo:
         return chat_history + [
-            {"role": "user",    "content": "(empty)"},
-            {"role": "assistant", "content": "⚠️ Please enter a repository in the format `owner/repo`."},
+            ("(empty)", "⚠️ Please enter a repository in the format `owner/repo`."),
         ], ""
 
     if "/" not in repo or len(repo.split("/")) != 2:
         return chat_history + [
-            {"role": "user",    "content": repo},
-            {"role": "assistant", "content": f'❌ Invalid format: `{repo}`\nUse `owner/repo` — e.g. `MogasalaHemagiri/Multi-Agent-Code-Stabilizer`'},
+            (repo, f'❌ Invalid format: `{repo}`\nUse `owner/repo` — e.g. `MogasalaHemagiri/Multi-Agent-Code-Stabilizer`'),
         ], repo
 
     if _audit_event.is_set():
         return chat_history + [
-            {"role": "user",    "content": repo},
-            {"role": "assistant", "content": "⚠️ An audit is already running. Please wait for it to complete before submitting another repo."},
+            (repo, "⚠️ An audit is already running. Please wait for it to complete before submitting another repo."),
         ], ""
 
     _audit_event.set()
@@ -776,21 +773,22 @@ def submit_repo_audit(repo_input: str, chat_history: list) -> tuple[list, str]:
     ).start()
 
     return chat_history + [
-        {"role": "user",    "content": f"🎯 Audit: `{repo}`"},
-        {"role": "assistant", "content": (
-            f"🚀 **Audit started for `{repo}`**\n\n"
-            f"Watch the **Live Agent Log** below for real-time progress.\n"
-            f"I'll post results here when the audit completes.\n\n"
-            f"_Model: `{MODEL}` · Tenant: `{TENANT_ID}`_"
-        )},
+        (
+            f"🎯 Audit: `{repo}`",
+            (
+                f"🚀 **Audit started for `{repo}`**\n\n"
+                f"Watch the **Live Agent Log** below for real-time progress.\n"
+                f"I'll post results here when the audit completes.\n\n"
+                f"_Model: `{MODEL}` · Tenant: `{TENANT_ID}`_"
+            ),
+        ),
     ], ""
 
 
 def get_inbox_history() -> list:
     """Pull any background-posted messages (e.g. audit-complete) into the chat."""
     with _inbox_lock:
-        msgs = [{"role": "assistant", "content": f"**{u}**\n{b}"}
-                for u, b in _inbox_history]
+        msgs = [(u, b) for u, b in _inbox_history]
         _inbox_history.clear()
     return msgs or []
 
@@ -1026,14 +1024,7 @@ with gr.Blocks(title="Rhodawk AI — Code Review Monster") as demo:
             inbox_chatbot = gr.Chatbot(
                 label="",
                 height=240,
-                type="messages",
                 show_label=False,
-                container=True,
-                placeholder=(
-                    "<div style='text-align:center; padding:40px 0; color:#475569;'>"
-                    "No audits yet. Enter a repo below and press <b>Run Audit</b>."
-                    "</div>"
-                ),
             )
 
             with gr.Row():
