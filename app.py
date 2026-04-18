@@ -98,9 +98,14 @@ for _key, _val in [("GITHUB_TOKEN", GITHUB_TOKEN), ("OPENROUTER_API_KEY", OPENRO
 # PATHS & CONSTANTS
 # ──────────────────────────────────────────────────────────────
 PERSISTENT_DIR = "/data"
-REPO_DIR = f"{PERSISTENT_DIR}/repo"
+REPO_DIR = f"{PERSISTENT_DIR}/repo"          # default; overridden per-audit below
 VENV_DIR = f"{PERSISTENT_DIR}/target_venv"
 MCP_RUNTIME_CONFIG = "/tmp/mcp_runtime.json"
+
+# ── Per-audit repo dir — updated atomically at audit start ────────────────────
+# Because _audit_event ensures only one audit runs at a time, updating this
+# global at audit start is safe without an additional lock.
+_current_target_repo: str = ""
 
 # ──────────────────────────────────────────────────────────────
 # BUG-005 FIX: Explicit startup initialization — ensures SQLite tables exist
@@ -732,17 +737,25 @@ def process_audit_test(
 
 
 def enterprise_audit_loop(repo_override: str = None, branch: str = "main", specific_test: str = None):
-    target_repo = repo_override or GITHUB_REPO
+    global REPO_DIR, _current_target_repo
+
+    target_repo = _normalize_repo(repo_override or "") or _normalize_repo(GITHUB_REPO) or (repo_override or GITHUB_REPO or "").strip()
     if not target_repo:
         ui_log("No target repo configured. Enter one in the chat inbox or set GITHUB_REPO.", "FAIL")
         _audit_event.clear()
         return
 
+    # ── KEY FIX: give every repo its own directory so switching repos
+    # never re-uses a stale clone from a previous audit. ─────────────
+    safe_name = target_repo.replace("/", "_").replace(".", "_")
+    REPO_DIR = f"{PERSISTENT_DIR}/repo_{safe_name}"
+    _current_target_repo = target_repo
+
     ui_log("═" * 70)
-    ui_log(f"AUDIT START — Tenant: {TENANT_ID} | Repo: {target_repo} | Model: {MODEL}")
+    ui_log(f"AUDIT START — Tenant: {TENANT_ID} | Repo: {target_repo} | Dir: {REPO_DIR} | Model: {MODEL}")
     notify_audit_start(target_repo)
     log_audit_event("AUDIT_START", "orchestrator", target_repo, MODEL,
-                    {"tenant": TENANT_ID, "branch": branch}, "STARTED")
+                    {"tenant": TENANT_ID, "branch": branch, "repo_dir": REPO_DIR}, "STARTED")
 
     # Prune stale completed jobs at the start of each audit run (TTL fix)
     from job_queue import prune_done_jobs
@@ -756,10 +769,10 @@ def enterprise_audit_loop(repo_override: str = None, branch: str = "main", speci
         mcp_config_path = write_mcp_config()
 
         if not os.path.exists(REPO_DIR):
-            ui_log("Cloning repository...")
+            ui_log(f"Cloning {target_repo} → {REPO_DIR} ...")
             Repo.clone_from(f"https://github.com/{target_repo}.git", REPO_DIR)
         else:
-            ui_log("Syncing to latest origin/main...")
+            ui_log(f"Repo dir exists — syncing {target_repo} to latest origin/main ...")
             safe_git_pull()
 
         # ── Language detection ────────────────────────────────────────
@@ -871,6 +884,47 @@ def enterprise_audit_loop(repo_override: str = None, branch: str = "main", speci
 
 
 # ──────────────────────────────────────────────────────────────
+# REPO INPUT NORMALISER
+# Accepts any of:
+#   owner/repo
+#   https://github.com/owner/repo
+#   https://github.com/owner/repo.git
+#   github.com/owner/repo
+# ──────────────────────────────────────────────────────────────
+def _normalize_repo(raw: str) -> str:
+    """Return 'owner/repo' from any common GitHub URL format, or '' if invalid."""
+    s = raw.strip().rstrip("/").removesuffix(".git")
+    # Strip common prefixes
+    for prefix in ("https://github.com/", "http://github.com/", "github.com/"):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    parts = [p for p in s.split("/") if p]
+    if len(parts) == 2:
+        return f"{parts[0]}/{parts[1]}"
+    return ""
+
+
+# ──────────────────────────────────────────────────────────────
+# TERMINATE / STOP AUDIT
+# ──────────────────────────────────────────────────────────────
+def terminate_audit() -> str:
+    """
+    Force-stop a running audit.
+    Clears _audit_event so the next submission is accepted immediately.
+    The background thread will finish its current subprocess naturally —
+    we cannot kill daemon threads in Python, but clearing the event means:
+      1. No new test jobs are dispatched after the current one finishes
+      2. The inbox immediately accepts new repo submissions
+    """
+    if not _audit_event.is_set():
+        return "ℹ️ No audit is currently running."
+    _audit_event.clear()
+    ui_log("⛔ Audit terminated by operator.", "WARN")
+    return "⛔ Audit stopped. You can now submit a new repository."
+
+
+# ──────────────────────────────────────────────────────────────
 # CHAT INBOX — target repo input
 # ──────────────────────────────────────────────────────────────
 def submit_repo_audit(repo_input: str, chat_history: list) -> tuple[list, str]:
@@ -878,25 +932,36 @@ def submit_repo_audit(repo_input: str, chat_history: list) -> tuple[list, str]:
     Called when user submits a repo via the chat inbox.
     Validates, kicks off the audit in a background thread, and
     returns an updated chat history using the messages format.
+    Accepts owner/repo, full GitHub URLs, and .git suffixes.
     """
-    repo = (repo_input or "").strip()
+    raw = (repo_input or "").strip()
 
-    if not repo:
+    if not raw:
         return chat_history + [
             {"role": "user", "content": "(empty)"},
-            {"role": "assistant", "content": "⚠️ Please enter a repository in the format `owner/repo`."},
+            {"role": "assistant", "content": "⚠️ Please enter a repository — e.g. `OWASP/pygoat` or `https://github.com/OWASP/pygoat`."},
         ], ""
 
-    if "/" not in repo or len(repo.split("/")) != 2:
+    repo = _normalize_repo(raw)
+    if not repo:
         return chat_history + [
-            {"role": "user", "content": repo},
-            {"role": "assistant", "content": f'❌ Invalid format: `{repo}`\nUse `owner/repo` — e.g. `MogasalaHemagiri/Multi-Agent-Code-Stabilizer`'},
-        ], repo
+            {"role": "user", "content": raw},
+            {"role": "assistant", "content": (
+                f'❌ Could not parse `{raw}` as a GitHub repo.\n'
+                'Accepted formats:\n'
+                '- `owner/repo`\n'
+                '- `https://github.com/owner/repo`\n'
+                '- `https://github.com/owner/repo.git`'
+            )},
+        ], raw
 
     if _audit_event.is_set():
         return chat_history + [
             {"role": "user", "content": repo},
-            {"role": "assistant", "content": "⚠️ An audit is already running. Please wait for it to complete before submitting another repo."},
+            {"role": "assistant", "content": (
+                "⚠️ An audit is already running.\n"
+                "Click **⛔ Terminate Audit** to stop it, then submit a new repo."
+            )},
         ], ""
 
     _audit_event.set()
@@ -1106,7 +1171,10 @@ def export_compliance_display() -> str:
 def reset_queue():
     import shutil
     shutil.rmtree("/data/jobs", ignore_errors=True)
-    return "✅ Job queue cleared."
+    # Also unblock the audit event so a new repo can be submitted immediately
+    _audit_event.clear()
+    ui_log("🗑 Queue cleared and audit lock released by operator.", "WARN")
+    return "✅ Queue cleared and audit stopped. You can now submit a new repository."
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1393,14 +1461,16 @@ with gr.Blocks(title="Rhodawk AI — Code Review Monster") as demo:
 
             gr.HTML("<div style='height:4px;'></div>")
 
-            # ── LEGACY TRIGGER ROW (uses GITHUB_REPO env if set) ─
+            # ── CONTROLS ROW ──────────────────────────────────────
             with gr.Row():
-                btn_audit = gr.Button("🚀 Trigger Full Healing Audit (env GITHUB_REPO)", variant="secondary", scale=3)
-                btn_reset = gr.Button("🗑 Reset Queue", variant="secondary", scale=1)
+                btn_audit     = gr.Button("🚀 Trigger Audit (env GITHUB_REPO)", variant="secondary", scale=3)
+                btn_terminate = gr.Button("⛔ Terminate Audit", variant="stop", scale=2)
+                btn_reset     = gr.Button("🗑 Reset Queue", variant="secondary", scale=1)
 
             trigger_out = gr.Textbox(label="", interactive=False, show_label=False)
-            btn_audit.click(trigger_audit_fn, outputs=trigger_out)
-            btn_reset.click(reset_queue, outputs=trigger_out)
+            btn_audit.click(trigger_audit_fn,  outputs=trigger_out)
+            btn_terminate.click(terminate_audit, outputs=trigger_out)
+            btn_reset.click(reset_queue,        outputs=trigger_out)
 
             # ── LIVE LOG ─────────────────────────────────────────
             live_logs = gr.TextArea(label="Live Agent Execution Log", lines=26, interactive=False)
