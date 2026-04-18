@@ -1183,7 +1183,6 @@ with gr.Blocks(title="Rhodawk AI — Code Review Monster") as demo:
                 label="",
                 height=240,
                 show_label=False,
-                type="messages",
             )
 
             with gr.Row():
