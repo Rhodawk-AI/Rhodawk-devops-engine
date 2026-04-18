@@ -3,17 +3,14 @@
     "TEMPLATE ONLY — contains NO secrets.",
     "Actual runtime config is written to /tmp/mcp_runtime.json at startup.",
     "FETCH_ALLOWED_DOMAINS prevents SSRF against internal services.",
-    "GITHUB_PERSONAL_ACCESS_TOKEN is injected from env at runtime — never committed.",
-    "NOTE: @modelcontextprotocol/server-fetch does not exist on npm.",
-    "      The fetch MCP server is a Python package (mcp-server-fetch on PyPI).",
-    "      It is installed via uv in the Dockerfile and invoked with `uvx mcp-server-fetch`."
+    "Secrets injected from env at runtime — never committed."
   ],
   "mcpServers": {
     "fetch-docs": {
       "command": "uvx",
       "args": ["mcp-server-fetch"],
       "env": {
-        "FETCH_ALLOWED_DOMAINS": "docs.python.org,pypi.org,docs.github.com,packaging.python.org,peps.python.org"
+        "FETCH_ALLOWED_DOMAINS": "docs.python.org,pypi.org,docs.github.com,packaging.python.org,peps.python.org,cwe.mitre.org,nvd.nist.gov,owasp.org,portswigger.net,hackerone.com,bugcrowd.com,cve.org,exploit-db.com,docs.rs,go.dev,nodejs.org,developer.mozilla.org"
       }
     },
     "github-manager": {
@@ -22,6 +19,29 @@
       "env": {
         "GITHUB_PERSONAL_ACCESS_TOKEN": "__INJECTED_BY_APP_AT_RUNTIME__"
       }
+    },
+    "filesystem-research": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/data/repo", "/tmp/research"],
+      "description": "Read-only access to cloned repos and research scratch space"
+    },
+    "memory-store": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-memory"],
+      "description": "Persistent knowledge graph for cross-session vulnerability memory"
+    },
+    "sequential-thinking": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
+      "description": "Structured chain-of-thought for complex vulnerability analysis"
+    },
+    "web-search": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-brave-search"],
+      "env": {
+        "BRAVE_API_KEY": "__INJECTED_BY_APP_AT_RUNTIME__"
+      },
+      "description": "Search for CVEs, exploit PoCs, vendor advisories, and security research"
     }
   }
 }

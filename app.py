@@ -35,6 +35,15 @@ from git import Repo
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from adversarial_reviewer import run_adversarial_review
+from hermes_orchestrator import (
+    run_hermes_research, get_hermes_logs, get_session_summary,
+    compute_ves, build_tvg,
+)
+from bounty_gateway import (
+    get_pipeline, get_pipeline_summary, human_approve, human_reject,
+    submit_to_hackerone, submit_github_advisory, add_to_pipeline,
+)
+from vuln_classifier import classify_vulnerability, get_all_cwes
 from audit_logger import export_compliance_report, log_audit_event, read_audit_trail, verify_chain_integrity
 from conviction_engine import evaluate_conviction, auto_merge_pr
 from formal_verifier import run_formal_verification
@@ -1375,6 +1384,151 @@ def reject_disclosure_fn(disclosure_id: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────
+# HERMES ORCHESTRATOR HELPERS
+# ──────────────────────────────────────────────────────────────
+
+_hermes_sessions: dict = {}
+_hermes_active_session_id: str = ""
+_hermes_running = threading.Event()
+
+
+def _hermes_run_background(
+    target_repo: str,
+    repo_dir: str,
+    focus_area: str,
+    max_iterations: int,
+) -> None:
+    global _hermes_active_session_id
+    _hermes_running.set()
+    try:
+        session = run_hermes_research(
+            target_repo=target_repo,
+            repo_dir=repo_dir,
+            focus_area=focus_area,
+            max_iterations=int(max_iterations),
+        )
+        _hermes_sessions[session.session_id] = session
+        _hermes_active_session_id = session.session_id
+
+        for finding in session.findings:
+            add_to_pipeline(
+                finding_id=finding.finding_id,
+                title=finding.title,
+                description=finding.description,
+                proof_of_concept=finding.proof_of_concept,
+                target_repo=target_repo,
+                cwe_id=finding.cwe_id,
+                severity=finding.severity,
+                estimated_cvss=round(finding.ves_score, 1),
+                bounty_tier="P1" if finding.ves_score >= 8 else "P2" if finding.ves_score >= 5 else "P3",
+                exploit_class=finding.exploit_primitive,
+            )
+    finally:
+        _hermes_running.clear()
+
+
+def hermes_start_research(
+    target_repo: str, local_path: str, focus_area: str, max_iter: str
+) -> str:
+    if _hermes_running.is_set():
+        return "⚠️ Hermes is already running a research session. Wait for it to complete."
+    if not target_repo.strip():
+        return "❌ Target repository is required (e.g. owner/repo)"
+
+    repo_dir = local_path.strip() or f"/data/repo/{target_repo.split('/')[-1]}"
+    if not os.path.isdir(repo_dir):
+        return f"❌ Local path not found: {repo_dir}\nClone the repo first using the main Audit tab."
+
+    t = threading.Thread(
+        target=_hermes_run_background,
+        args=(target_repo.strip(), repo_dir, focus_area.strip(), max_iter or 15),
+        daemon=True, name="hermes-research",
+    )
+    t.start()
+    return (
+        f"🧠 Hermes started on {target_repo}\n"
+        f"Focus: {focus_area or 'Full autonomous scan'}\n"
+        f"Max iterations: {max_iter}\n\n"
+        "Watch the live logs below. Findings will appear in the Disclosure Pipeline tab."
+    )
+
+
+def hermes_get_live_logs() -> str:
+    logs = get_hermes_logs()
+    status = "🔄 RUNNING" if _hermes_running.is_set() else "⏸ IDLE"
+    header = f"[HERMES STATUS: {status}]\n{'─' * 50}\n"
+    return header + "\n".join(logs[-80:]) if logs else header + "No logs yet."
+
+
+def hermes_get_session_summary() -> str:
+    if not _hermes_active_session_id:
+        return "No session completed yet."
+    session = _hermes_sessions.get(_hermes_active_session_id)
+    if not session:
+        return "Session not found."
+    summary = get_session_summary(session)
+    lines = [
+        f"Session: {summary['session_id']}",
+        f"Target: {summary['target']}",
+        f"Phase: {summary['phase']}",
+        f"Started: {summary['started_at']}",
+        f"Completed: {summary.get('completed_at', 'in progress')}",
+        f"Total findings: {summary['total_findings']}",
+        f"By severity: {summary['by_severity']}",
+        f"Tool calls: {summary['tool_calls']}",
+        f"Attack surface sinks: {summary['attack_surface_size']}",
+        "",
+        "TOP FINDINGS (by VES score):",
+    ]
+    for f in summary["top_findings"]:
+        lines.append(
+            f"  [{f['severity']}] {f['title'][:60]}\n"
+            f"    CWE: {f['cwe']} | VES: {f['ves']} | ACTS: {f['acts']}\n"
+            f"    File: {f['file']} | Status: {f['status']}"
+        )
+    return "\n".join(lines)
+
+
+def hermes_get_pipeline_display() -> str:
+    return get_pipeline_summary()
+
+
+def hermes_approve_finding(record_id: str, notes: str) -> str:
+    if not record_id.strip():
+        return "❌ Record ID required"
+    result = human_approve(record_id.strip(), notes.strip())
+    return f"✅ Finding {record_id} approved.\n{result}"
+
+
+def hermes_reject_finding(record_id: str, notes: str) -> str:
+    if not record_id.strip():
+        return "❌ Record ID required"
+    result = human_reject(record_id.strip(), notes.strip())
+    return f"❌ Finding {record_id} rejected.\n{result}"
+
+
+def hermes_submit_hackerone(record_id: str) -> str:
+    if not record_id.strip():
+        return "❌ Record ID required"
+    result = submit_to_hackerone(record_id.strip())
+    if result.get("success"):
+        return f"✅ Submitted to HackerOne: {result.get('url')}"
+    return f"❌ Submission failed: {result.get('error')}"
+
+
+def hermes_submit_github(record_id: str, owner_repo: str) -> str:
+    if not record_id.strip() or not owner_repo.strip():
+        return "❌ Record ID and owner/repo required"
+    parts = owner_repo.strip().split("/")
+    if len(parts) != 2:
+        return "❌ Format must be owner/repo"
+    result = submit_github_advisory(record_id.strip(), parts[0], parts[1])
+    if result.get("success"):
+        return f"✅ GitHub Advisory created: {result.get('url')}"
+    return f"❌ Submission failed: {result.get('error')}"
+
+
+# ──────────────────────────────────────────────────────────────
 # GRADIO ENTERPRISE DASHBOARD
 # ──────────────────────────────────────────────────────────────
 THEME = gr.themes.Base(
@@ -1802,13 +1956,134 @@ Approved disclosures generate a message you send manually via the maintainer's s
                     )
                     sr_reject_btn.click(reject_disclosure_fn, inputs=sr_did, outputs=sr_approval_out)
 
+        # ── HERMES AI SECURITY RESEARCHER TAB ──────────────────────
+        with gr.Tab("🧠 Hermes Zero-Day"):
+            gr.Markdown("""
+# Hermes — Autonomous Zero-Day Research Engine
+
+Hermes is your AI security researcher. Point it at any open source project and it will:
+- **Map the attack surface** (entry points, dangerous sinks, security-critical files)
+- **Run taint analysis** to trace untrusted input to dangerous sinks
+- **Perform symbolic execution** to find unchecked code paths
+- **Generate and run fuzz campaigns** to find crashes
+- **Reason about exploitability** (CVSS, PoC generation)
+- **Score findings** with VES (Vulnerability Entropy Score) + ACTS (Adversarial Consensus)
+
+**ALL findings require human approval before any disclosure is sent.**
+""")
+            with gr.Tabs():
+                with gr.Tab("🚀 Launch Research"):
+                    gr.Markdown("### Start an autonomous security research session")
+                    with gr.Row():
+                        hermes_repo     = gr.Textbox(label="Target Repository (owner/repo)", placeholder="torvalds/linux", scale=2)
+                        hermes_path     = gr.Textbox(label="Local Clone Path", placeholder="/data/repo/linux", scale=2)
+                    hermes_focus    = gr.Textbox(
+                        label="Focus Area (optional)",
+                        placeholder="memory management subsystem, authentication middleware, crypto primitives...",
+                    )
+                    with gr.Row():
+                        hermes_max_iter = gr.Slider(minimum=5, maximum=30, value=15, step=1, label="Max Research Iterations")
+                        hermes_launch   = gr.Button("🧠 Launch Hermes", variant="primary", scale=1)
+                    hermes_launch_out = gr.Textbox(label="Status", interactive=False, lines=5)
+                    hermes_launch.click(
+                        hermes_start_research,
+                        inputs=[hermes_repo, hermes_path, hermes_focus, hermes_max_iter],
+                        outputs=hermes_launch_out,
+                    )
+
+                with gr.Tab("📡 Live Research Logs"):
+                    hermes_live_logs = gr.TextArea(
+                        label="Hermes Research Log (auto-refreshes)",
+                        lines=30, interactive=False,
+                    )
+                    gr.Button("🔄 Refresh Logs", variant="secondary").click(
+                        hermes_get_live_logs, outputs=hermes_live_logs
+                    )
+
+                with gr.Tab("📊 Session Summary"):
+                    hermes_summary_out = gr.TextArea(label="Last Session Summary", lines=25, interactive=False)
+                    gr.Button("📊 Get Summary", variant="secondary").click(
+                        hermes_get_session_summary, outputs=hermes_summary_out
+                    )
+
+                with gr.Tab("🔒 Disclosure Pipeline"):
+                    gr.Markdown("""
+### Human-Approval Gate
+
+All findings sit here as **PENDING_HUMAN_APPROVAL** until you explicitly approve them.
+Hermes never auto-submits. You review, then approve or reject each finding individually.
+After approval, you can submit to HackerOne or create a GitHub Security Advisory.
+
+**90-day disclosure countdown starts on approval.**
+""")
+                    hermes_pipeline_out = gr.TextArea(label="Pipeline Status", lines=12, interactive=False)
+                    gr.Button("🔄 Refresh Pipeline", variant="secondary").click(
+                        hermes_get_pipeline_display, outputs=hermes_pipeline_out
+                    )
+
+                    gr.HTML("<hr/>")
+                    gr.Markdown("#### Review & Approve/Reject a Finding")
+                    with gr.Row():
+                        hermes_record_id = gr.Textbox(label="Record ID", scale=2)
+                        hermes_notes     = gr.Textbox(label="Analyst Notes", scale=3)
+                    with gr.Row():
+                        hermes_approve_btn = gr.Button("✅ Approve Finding", variant="primary")
+                        hermes_reject_btn  = gr.Button("❌ Reject Finding", variant="secondary")
+                    hermes_approval_out = gr.Textbox(label="Result", interactive=False)
+                    hermes_approve_btn.click(
+                        hermes_approve_finding,
+                        inputs=[hermes_record_id, hermes_notes],
+                        outputs=hermes_approval_out,
+                    )
+                    hermes_reject_btn.click(
+                        hermes_reject_finding,
+                        inputs=[hermes_record_id, hermes_notes],
+                        outputs=hermes_approval_out,
+                    )
+
+                    gr.HTML("<hr/>")
+                    gr.Markdown("#### Submit Approved Finding (requires credentials in env vars)")
+                    with gr.Row():
+                        hermes_submit_record = gr.Textbox(label="Approved Record ID", scale=2)
+                        hermes_gh_repo       = gr.Textbox(label="GitHub owner/repo (for GHSA)", placeholder="torvalds/linux", scale=2)
+                    with gr.Row():
+                        hermes_h1_btn  = gr.Button("🎯 Submit to HackerOne", variant="primary")
+                        hermes_gh_btn  = gr.Button("🐙 Create GitHub Advisory", variant="secondary")
+                    hermes_submit_out = gr.Textbox(label="Submission Result", interactive=False)
+                    hermes_h1_btn.click(
+                        hermes_submit_hackerone,
+                        inputs=[hermes_submit_record],
+                        outputs=hermes_submit_out,
+                    )
+                    hermes_gh_btn.click(
+                        hermes_submit_github,
+                        inputs=[hermes_submit_record, hermes_gh_repo],
+                        outputs=hermes_submit_out,
+                    )
+
+                with gr.Tab("📚 CWE Reference"):
+                    gr.Markdown("### CWE Taxonomy — Coverage Map")
+                    cwe_table_data = [
+                        [c["cwe_id"], c["name"], c["category"], c["severity"],
+                         str(c["cvss_base"]), c.get("owasp", "")]
+                        for c in get_all_cwes()
+                    ]
+                    gr.Dataframe(
+                        value=cwe_table_data,
+                        headers=["CWE ID", "Name", "Category", "Severity", "CVSS", "OWASP"],
+                        interactive=False,
+                    )
+
     # ── AUTO-REFRESH ────────────────────────────────────────────
     timer = gr.Timer(3)
-    timer.tick(get_live_logs,   outputs=live_logs)
-    timer.tick(get_metrics_row, outputs=[stat_status, stat_total, stat_done, stat_prs, stat_failed, stat_sast])
+    timer.tick(get_live_logs,       outputs=live_logs)
+    timer.tick(get_metrics_row,     outputs=[stat_status, stat_total, stat_done, stat_prs, stat_failed, stat_sast])
+    timer.tick(hermes_get_live_logs, outputs=hermes_live_logs)
 
     demo.load(get_live_logs,            outputs=live_logs)
     demo.load(get_metrics_row,          outputs=[stat_status, stat_total, stat_done, stat_prs, stat_failed, stat_sast])
+    demo.load(hermes_get_live_logs,     outputs=hermes_live_logs)
+    demo.load(hermes_get_pipeline_display, outputs=hermes_pipeline_out)
     demo.load(get_job_table,            outputs=job_table)
     demo.load(get_audit_display,        outputs=audit_log)
     demo.load(get_chain_integrity_display, outputs=chain_status)

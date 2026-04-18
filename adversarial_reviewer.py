@@ -22,10 +22,10 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 ADVERSARY_MODEL_PRIMARY = os.getenv(
     "RHODAWK_ADVERSARY_MODEL",
-    "openrouter/qwen/qwen-2.5-7b-instruct:free"
+    "deepseek/deepseek-r1:free"
 )
-ADVERSARY_MODEL_SECONDARY = "openrouter/google/gemma-2-9b-it:free"
-ADVERSARY_MODEL_TERTIARY  = "openrouter/mistralai/mistral-7b-instruct:free"
+ADVERSARY_MODEL_SECONDARY = "meta-llama/llama-3.3-70b-instruct:free"
+ADVERSARY_MODEL_TERTIARY  = "google/gemma-3-27b-it:free"
 
 _MODEL_CHAIN = [
     ADVERSARY_MODEL_PRIMARY,
