@@ -1110,6 +1110,190 @@ def reset_queue():
 
 
 # ──────────────────────────────────────────────────────────────
+# ETHICAL SECURITY RESEARCH PIPELINE
+# Human approval gate at every stage — nothing disclosed automatically
+# ──────────────────────────────────────────────────────────────
+
+def _research_clone(repo: str) -> str:
+    """Clone repo to a local research directory (read-only analysis)."""
+    repo_dir = f"/tmp/research_{repo.replace('/', '_')}"
+    if not os.path.exists(repo_dir):
+        ui_log(f"Cloning {repo} for static analysis...", "INFO")
+        Repo.clone_from(f"https://github.com/{repo}.git", repo_dir)
+    return repo_dir
+
+
+def run_semantic_analysis(repo_input: str) -> tuple[str, str]:
+    """Pure static analysis — no code executed."""
+    repo = (repo_input or "").strip()
+    if not repo or "/" not in repo or len(repo.split("/")) != 2:
+        return "❌ Use format: owner/repo", ""
+    try:
+        from semantic_extractor import run_semantic_extraction
+        from language_runtime import RuntimeFactory
+        repo_dir = _research_clone(repo)
+        runtime = RuntimeFactory.for_repo(repo_dir)
+        result = run_semantic_extraction(repo_dir, runtime.language)
+        gaps = result.get("assumption_gaps", [])
+        summary = (
+            f"Static analysis complete.\n"
+            f"Language: {result.get('language', 'unknown')}\n"
+            f"Files analysed: {len(result.get('analyzed_files', []))}\n"
+            f"Assumption gaps found: {len(gaps)}\n\n"
+            f"All findings tagged requires_human_verification=true."
+        )
+        ui_log(f"Semantic analysis: {repo} → {len(gaps)} gap(s)", "INFO")
+        return summary, json.dumps(result, indent=2)[:10000]
+    except Exception as e:
+        return f"Analysis failed: {e}", ""
+
+
+def generate_harness_for_review(gap_json: str, repo_input: str) -> str:
+    """Generate PoC harness for operator review — NOT executed here."""
+    try:
+        from harness_factory import generate_poc_harness
+        gap = json.loads(gap_json)
+        repo_dir = f"/tmp/research_{repo_input.strip().replace('/', '_')}"
+        result = generate_poc_harness(gap, repo_dir)
+        if "error" in result:
+            return f"Generation failed: {result['error']}"
+        return (
+            f"Status: {result['status']}\n"
+            f"Gap ID: {result['gap_id']}\n\n"
+            f"--- REVIEW THIS CODE BEFORE APPROVING EXECUTION ---\n\n"
+            f"{result['harness_code']}"
+        )
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def execute_approved_harness(harness_code: str, repo_input: str, venv_path: str) -> str:
+    """
+    Sandbox execution — only after operator reads and approves harness.
+    No network access, secrets stripped, 30 s timeout.
+    """
+    if not harness_code.strip():
+        return "❌ No harness code provided."
+    try:
+        from harness_factory import run_harness_in_sandbox
+        repo_dir = f"/tmp/research_{repo_input.strip().replace('/', '_')}"
+        r = run_harness_in_sandbox(harness_code, repo_dir, venv_path.strip() or "/data/target_venv")
+        status = "⚠️  GAP TRIGGERED in sandbox" if r.get("triggered") else "✅ Not triggered"
+        return (
+            f"{status}\n\n"
+            f"Exit code : {r.get('exit_code', 'N/A')}\n"
+            f"Timed out : {r.get('timed_out', False)}\n\n"
+            f"Stdout:\n{r.get('stdout', '')}\n\n"
+            f"Stderr:\n{r.get('stderr', '')}"
+        )
+    except Exception as e:
+        return f"Sandbox error: {e}"
+
+
+def store_primitive_finding(
+    repo_input: str, gap_id: str, severity: str,
+    description: str, triggered_str: str, sandbox_output: str,
+) -> str:
+    try:
+        from chain_analyzer import store_primitive
+        triggered = "TRIGGERED: True" in (sandbox_output or "")
+        fid = store_primitive(
+            repo=repo_input.strip(), gap_id=gap_id.strip(),
+            severity=severity.strip(), description=description.strip(),
+            triggered=triggered, confidence="MEDIUM",
+            harness_result={"stdout": sandbox_output},
+        )
+        return f"✅ Primitive stored with ID: {fid}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def run_chain_analysis(repo_input: str) -> str:
+    try:
+        from chain_analyzer import analyze_chains, get_pending_chains
+        repo = repo_input.strip()
+        chains = analyze_chains(repo) if repo else []
+        pending = get_pending_chains(repo if repo else None)
+        if not pending:
+            return "No chains identified yet. Store primitive findings first."
+        lines = []
+        for c in pending:
+            lines.append(
+                f"[{c['id']}] {c['severity']} | Confidence: {c['confidence']}\n"
+                f"  Repo: {c['repo']}\n"
+                f"  {c['description'][:200]}\n"
+                f"  Status: {c['status']}"
+            )
+        return f"Proposed chains (PENDING HUMAN REVIEW):\n\n" + "\n\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def get_vault_display() -> str:
+    try:
+        from disclosure_vault import get_all_disclosures
+        items = get_all_disclosures()
+        if not items:
+            return "No disclosures yet."
+        lines = []
+        for d in items:
+            lines.append(
+                f"[{d['id']}] {d['severity']} — {d['repo']}\n"
+                f"  Title : {d['title'][:70]}\n"
+                f"  Status: {d['status']} | Days remaining: {d['days_remaining']}\n"
+                f"  Bug Bounty: {d.get('bug_bounty_program','N/A')}"
+            )
+        return "\n\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def read_dossier_fn(disclosure_id: str) -> str:
+    try:
+        from disclosure_vault import read_dossier
+        return read_dossier(disclosure_id.strip())
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def compile_dossier_fn(
+    repo_input: str, gap_json: str, harness_result: str, bug_bounty: str,
+) -> str:
+    try:
+        from disclosure_vault import compile_dossier
+        gap = json.loads(gap_json) if gap_json.strip() else {}
+        did = compile_dossier(
+            repo=repo_input.strip(),
+            semantic_graph={},
+            assumption_gap=gap,
+            harness_result={"stdout": harness_result, "triggered": "TRIGGERED: True" in harness_result},
+            bug_bounty_program=bug_bounty.strip(),
+        )
+        return f"✅ Dossier compiled. Disclosure ID: {did}\nStatus: DRAFT — awaiting human approval."
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def approve_and_prepare_msg(disclosure_id: str, approver: str) -> str:
+    try:
+        from disclosure_vault import approve_disclosure, prepare_disclosure_message
+        approve_disclosure(disclosure_id.strip(), approver.strip() or "operator")
+        msg = prepare_disclosure_message(disclosure_id.strip())
+        return f"✅ Approved by: {approver}\n\n--- DISCLOSURE MESSAGE (send manually) ---\n\n{msg}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def reject_disclosure_fn(disclosure_id: str) -> str:
+    try:
+        from disclosure_vault import reject_disclosure
+        reject_disclosure(disclosure_id.strip())
+        return f"✅ Disclosure {disclosure_id.strip()} rejected and archived."
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ──────────────────────────────────────────────────────────────
 # GRADIO ENTERPRISE DASHBOARD
 # ──────────────────────────────────────────────────────────────
 THEME = gr.themes.Base(
@@ -1393,6 +1577,147 @@ GET  /webhook/queue     — Current job status (JSON)
 - 24/7 continuous loop via harvester dispatch → audit → heal → PR cycle
 - Public leaderboard (`public_leaderboard.py`) — real numbers, real PRs, no fake metrics
             """)
+
+        # ── TAB 11: ETHICAL SECURITY RESEARCH ────────────────────
+        with gr.Tab("🔬 Security Research"):
+            gr.Markdown("""
+### Ethical Security Research Pipeline
+
+Static analysis → Human review → Responsible disclosure
+
+**Every stage requires explicit operator approval. Nothing is disclosed automatically.**  
+All PoC testing is local and sandboxed. No live systems are attacked.
+            """)
+
+            with gr.Tabs():
+
+                # Step 1 — Semantic Analysis
+                with gr.Tab("1. Semantic Analysis"):
+                    gr.Markdown(
+                        "**Static analysis only — no code executed.** "
+                        "Hermes maps the repo's trust state machine and identifies assumption gaps."
+                    )
+                    sr_repo = gr.Textbox(
+                        label="Open-source repository (owner/repo)",
+                        placeholder="e.g. psf/requests  or  pallets/flask",
+                    )
+                    sr_analyze_btn = gr.Button("🔍 Run Semantic Analysis", variant="primary")
+                    sr_summary = gr.Textbox(label="Summary", interactive=False, lines=6)
+                    sr_graph   = gr.TextArea(label="State Machine Graph + Assumption Gaps (JSON)", lines=22, interactive=False)
+                    sr_analyze_btn.click(
+                        run_semantic_analysis,
+                        inputs=sr_repo,
+                        outputs=[sr_summary, sr_graph],
+                    )
+
+                # Step 2 — Harness Generation
+                with gr.Tab("2. Generate PoC (Review Only)"):
+                    gr.Markdown(
+                        "Paste a single assumption gap JSON from Step 1. "
+                        "Hermes generates a minimal PoC harness **for your review**. "
+                        "The harness is NOT executed here."
+                    )
+                    sr_gap_input  = gr.TextArea(label="Assumption Gap JSON", lines=10)
+                    sr_repo2      = gr.Textbox(label="Repository (owner/repo)")
+                    sr_gen_btn    = gr.Button("⚙️ Generate Harness for Review", variant="secondary")
+                    sr_harness    = gr.TextArea(
+                        label="Generated Harness — READ CAREFULLY BEFORE PROCEEDING",
+                        lines=22, interactive=True,
+                    )
+                    sr_gen_btn.click(
+                        generate_harness_for_review,
+                        inputs=[sr_gap_input, sr_repo2],
+                        outputs=sr_harness,
+                    )
+
+                # Step 3 — Sandbox Execution
+                with gr.Tab("3. Sandbox Execution (Operator Approved)"):
+                    gr.Markdown("""
+**By clicking Execute you confirm:**
+- You have read every line of the harness above
+- You authorise local sandbox execution only
+- No network connections will be made
+- Execution is time-limited to 30 seconds
+                    """)
+                    sr_exec_code = gr.TextArea(label="Harness Code (reviewed by operator)", lines=15)
+                    with gr.Row():
+                        sr_exec_repo = gr.Textbox(label="Repository (owner/repo)", scale=3)
+                        sr_exec_venv = gr.Textbox(label="Venv path", value="/data/target_venv", scale=2)
+                    sr_exec_btn  = gr.Button("🚀 Execute in Sandbox (I have reviewed this code)", variant="primary")
+                    sr_exec_out  = gr.TextArea(label="Sandbox Result", lines=12, interactive=False)
+                    sr_exec_btn.click(
+                        execute_approved_harness,
+                        inputs=[sr_exec_code, sr_exec_repo, sr_exec_venv],
+                        outputs=sr_exec_out,
+                    )
+
+                # Step 4 — Store & Chain Analysis
+                with gr.Tab("4. Chain Analysis"):
+                    gr.Markdown(
+                        "Store primitive findings, then ask Hermes to propose theoretical chains. "
+                        "All chain proposals are tagged PENDING_HUMAN_REVIEW."
+                    )
+                    with gr.Row():
+                        sr_prim_repo  = gr.Textbox(label="Repository", scale=2)
+                        sr_prim_gapid = gr.Textbox(label="Gap ID", scale=1)
+                        sr_prim_sev   = gr.Textbox(label="Severity", value="P2", scale=1)
+                    sr_prim_desc    = gr.Textbox(label="Description", lines=2)
+                    sr_prim_sandbox = gr.TextArea(label="Sandbox Output (from Step 3)", lines=5)
+                    sr_store_btn    = gr.Button("💾 Store Primitive Finding", variant="secondary")
+                    sr_store_out    = gr.Textbox(label="", interactive=False)
+                    sr_store_btn.click(
+                        store_primitive_finding,
+                        inputs=[sr_prim_repo, sr_prim_gapid, sr_prim_sev, sr_prim_desc, sr_prim_gapid, sr_prim_sandbox],
+                        outputs=sr_store_out,
+                    )
+                    gr.HTML("<hr/>")
+                    sr_chain_repo = gr.Textbox(label="Repository for chain analysis (leave blank for all)")
+                    sr_chain_btn  = gr.Button("🔗 Analyse Chains", variant="secondary")
+                    sr_chain_out  = gr.TextArea(label="Proposed Chains (PENDING HUMAN REVIEW)", lines=14, interactive=False)
+                    sr_chain_btn.click(run_chain_analysis, inputs=sr_chain_repo, outputs=sr_chain_out)
+
+                # Step 5 — Disclosure Vault
+                with gr.Tab("5. Disclosure Vault"):
+                    gr.Markdown("""
+**Human approval is mandatory before any disclosure is sent.**  
+Approved disclosures generate a message you send manually via the maintainer's security policy.
+                    """)
+                    with gr.Row():
+                        sr_vault_repo   = gr.Textbox(label="Repository (owner/repo)", scale=3)
+                        sr_vault_bounty = gr.Textbox(label="Bug bounty programme URL", scale=2)
+                    sr_vault_gap  = gr.TextArea(label="Assumption Gap JSON", lines=6)
+                    sr_vault_poc  = gr.TextArea(label="Sandbox output from Step 3", lines=4)
+                    sr_compile_btn = gr.Button("📋 Compile Disclosure Dossier", variant="secondary")
+                    sr_compile_out = gr.Textbox(label="", interactive=False)
+                    sr_compile_btn.click(
+                        compile_dossier_fn,
+                        inputs=[sr_vault_repo, sr_vault_gap, sr_vault_poc, sr_vault_bounty],
+                        outputs=sr_compile_out,
+                    )
+
+                    gr.HTML("<hr/>")
+                    gr.Button("🔄 Refresh Vault", variant="secondary").click(
+                        get_vault_display, outputs=gr.TextArea(label="All Disclosures", lines=10, interactive=False)
+                    )
+
+                    gr.HTML("<hr/>")
+                    sr_did       = gr.Textbox(label="Disclosure ID")
+                    sr_read_btn  = gr.Button("📄 Read Full Dossier", variant="secondary")
+                    sr_dossier   = gr.TextArea(label="Dossier (read before approving)", lines=24, interactive=False)
+                    sr_read_btn.click(read_dossier_fn, inputs=sr_did, outputs=sr_dossier)
+
+                    gr.HTML("<hr/>")
+                    sr_approver  = gr.Textbox(label="Your name (approval record)")
+                    with gr.Row():
+                        sr_approve_btn = gr.Button("✅ Approve & Prepare Disclosure Message", variant="primary")
+                        sr_reject_btn  = gr.Button("❌ Reject & Archive", variant="secondary")
+                    sr_approval_out = gr.TextArea(label="Result / Disclosure Message (send manually)", lines=14, interactive=False)
+                    sr_approve_btn.click(
+                        approve_and_prepare_msg,
+                        inputs=[sr_did, sr_approver],
+                        outputs=sr_approval_out,
+                    )
+                    sr_reject_btn.click(reject_disclosure_fn, inputs=sr_did, outputs=sr_approval_out)
 
     # ── AUTO-REFRESH ────────────────────────────────────────────
     timer = gr.Timer(3)
