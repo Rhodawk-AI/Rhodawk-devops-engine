@@ -947,16 +947,30 @@ def trigger_swebench_eval(max_instances: int = 25) -> str:
     def _run():
         try:
             from swebench_harness import run_swebench_eval
-            result = run_swebench_eval(max_instances=int(max_instances))
+            # BUG-009 / GAP-F FIX: Route through Rhodawk's own healing loop so
+            # pass@1 metrics are produced by the same pipeline used in production,
+            # not by an external stub command.
+            with _active_runtime_lock:
+                runtime = _active_runtime
+            env_cfg = runtime.setup_env(REPO_DIR, PERSISTENT_DIR) if runtime else None
+            mcp_cfg = write_mcp_config()
+            result = run_swebench_eval(
+                max_instances=int(max_instances),
+                process_fn=process_failing_test if runtime else None,
+                env_config=env_cfg,
+                mcp_config_path=mcp_cfg,
+                repo_dir=REPO_DIR,
+            )
             ui_log(
                 f"SWE-bench complete — pass@1={result['pass_at_1']:.2%}, "
-                f"resolved={result['resolved']}/{result['total']}",
+                f"resolved={result['resolved']}/{result['total']} "
+                f"(mode={result.get('mode', 'unknown')})",
                 "BENCH",
             )
         except Exception as e:
             ui_log(f"SWE-bench eval failed: {e}", "BENCH")
     threading.Thread(target=_run, daemon=True).start()
-    return f"🧪 SWE-bench Verified evaluation started for {int(max_instances)} instance(s)."
+    return f"SWE-bench Verified evaluation started for {int(max_instances)} instance(s) via Rhodawk loop."
 
 
 def get_swebench_display() -> str:
@@ -1232,6 +1246,23 @@ Fix: `configure_git_credentials()` now writes `/tmp/.gitconfig` directly and set
 
 if __name__ == "__main__":
     ui_log(f"Rhodawk AI v3.0 starting — Tenant: {TENANT_ID} | Model: {MODEL}")
+
+    # MINOR BUG FIX: Pre-warm the embedding model in a background thread so the
+    # first real retrieval call does not block on a multi-second model download.
+    def _prewarm():
+        try:
+            from embedding_memory import pre_warm_model
+            ok = pre_warm_model()
+            ui_log(
+                "Embedding model pre-warmed successfully." if ok
+                else "Embedding model pre-warm failed — will retry on first use.",
+                "MEM"
+            )
+        except Exception as _e:
+            ui_log(f"Embedding model pre-warm error (non-fatal): {_e}", "MEM")
+
+    threading.Thread(target=_prewarm, daemon=True).start()
+
     ui_log("Starting webhook server on port 7861...")
     start_webhook_server()
     ui_log("Webhook server running. Launching dashboard...")

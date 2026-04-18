@@ -1269,6 +1269,34 @@ def handoff_to_blue_team(
             "OK" if blue_result.success else "FAIL"
         )
 
+        # GAP-E FIX: Record Red Team → Blue Team outcome back to the training store.
+        # This closes the data flywheel — red-team-discovered crashes and their
+        # autonomous fixes become training examples, just like human-written test failures.
+        try:
+            from training_store import record_pattern
+            import hashlib as _hashlib
+            context_hash = _hashlib.sha256(
+                f"{crash.crash_hash}::{crash.crash_type}".encode()
+            ).hexdigest()[:16]
+            record_pattern(
+                failure_output=(
+                    f"[RED_TEAM/{crash.crash_type}] "
+                    f"fn={crash.target.profile.function_name} "
+                    f"example={crash.falsifying_example[:200]}\n"
+                    f"{crash.crash_output[:1000]}"
+                ),
+                context_hash=context_hash,
+                fix_diff=blue_result.final_diff,
+                success=blue_result.success,
+            )
+            rte_log(
+                f"GAP-E: Red Team outcome recorded to training store "
+                f"(crash={crash.crash_type}, patched={blue_result.success})",
+                "MEM"
+            )
+        except Exception as record_err:
+            rte_log(f"GAP-E: Training store record failed (non-fatal): {record_err}", "WARN")
+
         return handoff_result
 
     except Exception as e:

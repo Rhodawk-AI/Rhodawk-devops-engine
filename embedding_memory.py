@@ -26,6 +26,20 @@ def _get_model():
     return _MODEL
 
 
+def pre_warm_model() -> bool:
+    """
+    MINOR BUG FIX: Pre-warm the sentence-transformers model at startup so the
+    first real retrieval call does not incur multi-second model download latency.
+    Call this once at app startup in a background thread.
+    Returns True if model loaded successfully, False otherwise.
+    """
+    try:
+        _get_model()
+        return True
+    except Exception:
+        return False
+
+
 def _normalize_failure(failure_output: str) -> str:
     text = re.sub(r'File "[^"]+", line \d+', "File <path>, line <n>", failure_output)
     text = re.sub(r"/[\w./-]+", "<path>", text)
