@@ -2,22 +2,23 @@
 FROM python:3.12-slim AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends git curl ca-certificates build-essential && \
     rm -rf /var/lib/apt/lists/*
 
-# Install uv for fast, conflict-free resolution
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
-    mv /root/.local/bin/uv /usr/local/bin/uv
+# Fix: Use the official Astral image for a complete, clean uv installation
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 WORKDIR /build
 COPY requirements.txt .
 
-# FIX: Use uv to resolve the entire requirements tree at once.
-# This prevents the "ResolutionImpossible" error by finding the 
-# valid intersection between Gradio 5 and Aider-chat.
+# [span_1](start_span)FIX: Use uv to resolve the entire requirements tree at once.[span_1](end_span)
+# [span_2](start_span)This prevents the "ResolutionImpossible" error by finding the[span_2](end_span)
+# [span_3](start_span)valid intersection between Gradio 5 and Aider-chat.[span_3](end_span)
 RUN uv pip install --no-cache --system -r requirements.txt mcp-server-fetch && \
     pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt mcp-server-fetch
 
@@ -27,12 +28,16 @@ FROM python:3.12-slim AS runtime
 
 LABEL org.opencontainers.image.title="Rhodawk AI DevSecOps Engine"
 
+# Added critical uv environment variables to force system Python
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     GRADIO_SERVER_NAME=0.0.0.0 \
     GRADIO_SERVER_PORT=7860 \
     HOME=/home/rhodawk \
-    PATH="/home/rhodawk/.local/bin:/usr/local/bin:$PATH"
+    PATH="/home/rhodawk/.local/bin:/usr/local/bin:$PATH" \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_PREFERENCE=system \
+    UV_PYTHON=/usr/local/bin/python
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends git curl ca-certificates nodejs npm && \
@@ -51,8 +56,8 @@ WORKDIR /app
 # Copy pre-built wheels from builder
 COPY --from=builder /wheels /wheels
 
-# ADDED FIX: Copy the uv executable from the builder stage
-COPY --from=builder /usr/local/bin/uv /usr/local/bin/uv
+# ADDED FIX: Copy the uv executable from the official image
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 RUN pip install --no-cache-dir /wheels/* && rm -rf /wheels
 
