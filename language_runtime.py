@@ -246,9 +246,36 @@ class PythonRuntime(LanguageRuntime):
         return any(os.path.exists(os.path.join(repo_dir, m)) for m in markers)
 
     def setup_env(self, repo_dir: str, persistent_dir: str = "/data") -> EnvConfig:
+        import sys
         venv_dir = os.path.join(persistent_dir, "target_venv")
+
+        # FIX: guarantee the parent directory exists before uv/venv tries to write into it.
+        # In HuggingFace Spaces /data is a mounted volume that may not be pre-created.
+        os.makedirs(persistent_dir, exist_ok=True)
+
         if not os.path.exists(venv_dir):
-            self._run(["uv", "venv", venv_dir], cwd="/tmp", raise_on_error=True)
+            # FIX: pass --python explicitly so uv never has to auto-resolve a Python
+            # interpreter.  Without this flag, uv exits 2 when UV_PYTHON is absent or
+            # the managed-Python toolchain cache is cold (common in Space restarts).
+            out, code = self._run(
+                ["uv", "venv", "--python", sys.executable, venv_dir],
+                cwd="/tmp",
+            )
+            if code != 0:
+                # FIX: graceful fallback to stdlib venv — always available because we
+                # are already running inside the correct interpreter.
+                ui_msg = (
+                    f"uv venv failed (exit {code}) — falling back to "
+                    f"python -m venv. uv output: {out.strip()[:200]}"
+                )
+                import warnings
+                warnings.warn(ui_msg)
+                self._run(
+                    [sys.executable, "-m", "venv", venv_dir],
+                    cwd="/tmp",
+                    raise_on_error=True,
+                )
+
         req_path = os.path.join(repo_dir, "requirements.txt")
         if os.path.exists(req_path):
             self._run(
@@ -263,6 +290,7 @@ class PythonRuntime(LanguageRuntime):
                     ["uv", "pip", "install", "--python", venv_dir, "--quiet", "-e", ".[dev,test]"],
                     cwd=repo_dir, timeout=600,
                 )
+
         pytest_bin = os.path.join(venv_dir, "bin", "pytest")
         return EnvConfig(
             language="python",

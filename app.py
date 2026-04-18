@@ -306,16 +306,35 @@ def get_changed_files() -> list[str]:
 
 
 def setup_target_venv() -> str:
+    import sys as _sys
+
+    # FIX: ensure /data (PERSISTENT_DIR) exists before writing into it.
+    os.makedirs(PERSISTENT_DIR, exist_ok=True)
+
     if not os.path.exists(VENV_DIR):
         ui_log("Creating isolated virtualenv via uv...")
-        run_subprocess_safe(["uv", "venv", VENV_DIR], cwd="/tmp")
+        # FIX: pass --python explicitly; without it uv exits 2 on Space restarts
+        # when its managed-Python cache is cold or UV_PYTHON is unresolvable.
+        _, code = run_subprocess_safe(
+            ["uv", "venv", "--python", _sys.executable, VENV_DIR],
+            cwd="/tmp", raise_on_error=False,
+        )
+        if code != 0:
+            # FIX: fallback to stdlib venv so the audit can continue even when
+            # uv's Python resolution fails inside the container.
+            ui_log(f"⚠️  uv venv failed (exit {code}) — falling back to python -m venv...")
+            run_subprocess_safe(
+                [_sys.executable, "-m", "venv", VENV_DIR],
+                cwd="/tmp", raise_on_error=True,
+            )
+
     pytest_bin = os.path.join(VENV_DIR, "bin", "pytest")
     req_path = os.path.join(REPO_DIR, "requirements.txt")
     if os.path.exists(req_path):
         ui_log("Installing target repo deps via uv...")
         run_subprocess_safe(
             ["uv", "pip", "install", "--python", VENV_DIR, "--quiet", "-r", req_path],
-            cwd=REPO_DIR, timeout=600,
+            cwd=REPO_DIR, timeout=600, raise_on_error=False,
         )
     return pytest_bin
 
