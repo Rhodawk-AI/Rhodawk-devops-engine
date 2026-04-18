@@ -770,7 +770,16 @@ def enterprise_audit_loop(repo_override: str = None, branch: str = "main", speci
 
         if not os.path.exists(REPO_DIR):
             ui_log(f"Cloning {target_repo} → {REPO_DIR} ...")
-            Repo.clone_from(f"https://github.com/{target_repo}.git", REPO_DIR)
+            # FIX-009: Use run_subprocess_safe instead of Repo.clone_from so that
+            # GIT_CONFIG_GLOBAL (set by configure_git_credentials) is propagated to
+            # the git subprocess via os.environ.copy().  gitpython's Repo.clone_from
+            # spawns its own subprocess which inherits os.environ, but only when the
+            # env parameter is not overridden — using run_subprocess_safe is safer
+            # because it explicitly copies os.environ (including GIT_CONFIG_GLOBAL).
+            run_subprocess_safe(
+                ["git", "clone", "-v", f"https://github.com/{target_repo}.git", REPO_DIR],
+                cwd="/tmp", raise_on_error=True,
+            )
         else:
             ui_log(f"Repo dir exists — syncing {target_repo} to latest origin/main ...")
             safe_git_pull()
@@ -1187,7 +1196,11 @@ def _research_clone(repo: str) -> str:
     repo_dir = f"/tmp/research_{repo.replace('/', '_')}"
     if not os.path.exists(repo_dir):
         ui_log(f"Cloning {repo} for static analysis...", "INFO")
-        Repo.clone_from(f"https://github.com/{repo}.git", repo_dir)
+        # FIX-009: Use run_subprocess_safe so GIT_CONFIG_GLOBAL credentials are inherited.
+        run_subprocess_safe(
+            ["git", "clone", "-v", f"https://github.com/{repo}.git", repo_dir],
+            cwd="/tmp", raise_on_error=True,
+        )
     return repo_dir
 
 

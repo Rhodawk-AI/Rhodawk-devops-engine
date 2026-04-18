@@ -247,7 +247,13 @@ class PythonRuntime(LanguageRuntime):
 
     def setup_env(self, repo_dir: str, persistent_dir: str = "/data") -> EnvConfig:
         import sys
-        venv_dir = os.path.join(persistent_dir, "target_venv")
+        # FIX-011: Use a per-repo venv name derived from repo_dir so that switching
+        # between target repos never reuses a stale virtualenv with different deps.
+        # The old shared "target_venv" caused "[Errno 2] No such file or directory:
+        # '/data/target_venv/bin/pip'" when the venv belonged to a different repo.
+        import hashlib as _hashlib
+        _repo_hash = _hashlib.md5(repo_dir.encode()).hexdigest()[:8]
+        venv_dir = os.path.join(persistent_dir, f"target_venv_{_repo_hash}")
 
         # FIX: guarantee the parent directory exists before uv/venv tries to write into it.
         # In HuggingFace Spaces /data is a mounted volume that may not be pre-created.
@@ -285,10 +291,14 @@ class PythonRuntime(LanguageRuntime):
                     raise_on_error=True,
                 )
 
-        pip_bin = os.path.join(venv_dir, "bin", "pip")
+        # FIX-010: Resolve the venv's python interpreter to use as the pip fallback.
+        # Using `python -m pip` via the venv's python binary avoids the "No such file or
+        # directory: '/data/target_venv/bin/pip'" error seen when a fresh venv was created
+        # via `python -m venv` (which includes pip) but the bare pip script is absent.
+        venv_python = os.path.join(venv_dir, "bin", "python")
 
         def _install_deps(args: list[str]) -> bool:
-            """Try uv pip install first; fall back to pip on failure."""
+            """Try uv pip install first; fall back to the venv python -m pip on failure."""
             out, code = self._run(
                 ["uv", "pip", "install", "--python", venv_dir, "--quiet"] + args,
                 cwd=repo_dir, timeout=600, extra_env=uv_env,
@@ -296,8 +306,10 @@ class PythonRuntime(LanguageRuntime):
             if code != 0:
                 import warnings
                 warnings.warn(f"uv pip install failed (exit {code}) — falling back to pip. {out.strip()[:200]}")
+                # FIX-010: use venv_python -m pip instead of a bare pip_bin path —
+                # the `pip` script may be absent in freshly-created stdlib venvs.
                 _, pip_code = self._run(
-                    [pip_bin, "install", "--quiet"] + args,
+                    [venv_python, "-m", "pip", "install", "--quiet"] + args,
                     cwd=repo_dir, timeout=600,
                 )
                 return pip_code == 0
