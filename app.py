@@ -15,7 +15,6 @@ Full loop:
   11. Webhook server runs in parallel for event-driven triggers
 """
 
-import glob
 import hashlib
 import json
 import os
@@ -61,6 +60,10 @@ from verification_loop import (
 )
 from webhook_server import set_job_dispatcher, start_webhook_server
 from worker_pool import MAX_WORKERS, run_parallel_audit
+from language_runtime import RuntimeFactory, LanguageRuntime, EnvConfig
+
+# Module-level runtime handle — set once repo is cloned
+_active_runtime: LanguageRuntime | None = None
 
 # ──────────────────────────────────────────────────────────────
 # SECRETS — env only, never hardcoded
@@ -186,7 +189,13 @@ def write_mcp_config() -> str:
         "mcpServers": {
             "fetch-docs": {
                 "command": "uvx", "args": ["mcp-server-fetch"],
-                "env": {"FETCH_ALLOWED_DOMAINS": "docs.python.org,pypi.org,docs.github.com,packaging.python.org,peps.python.org,semver.org"}
+                "env": {
+                    "FETCH_ALLOWED_DOMAINS": (
+                        ",".join(_active_runtime.get_mcp_domains())
+                        if _active_runtime
+                        else "docs.python.org,pypi.org,docs.github.com"
+                    )
+                }
             },
             "github-manager": {
                 "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"],
@@ -331,7 +340,7 @@ def run_aider(mcp_config_path: str, prompt: str, context_files: list[str]) -> tu
 def process_failing_test(
     test_path: str,
     initial_failure: str,
-    pytest_bin: str,
+    env_config: EnvConfig,
     mcp_config_path: str,
     job_id: str,
     branch_name: str,
@@ -419,8 +428,8 @@ def process_failing_test(
 
         # ── Step 5: RE-RUN TESTS ────────────────────────────────
         ui_log(f"Verifying fix — re-running tests (attempt {attempt_num})...", "INFO")
-        test_output, test_code = run_subprocess_safe(
-            [pytest_bin, test_path, "-v", "--tb=short"], cwd=REPO_DIR, timeout=120, raise_on_error=False
+        test_output, test_code = _active_runtime.run_tests(
+            test_path, REPO_DIR, env_config, timeout=120
         )
 
         attempt = VerificationAttempt(
@@ -432,7 +441,7 @@ def process_failing_test(
 
         # ── Step 6: SAST gate ────────────────────────────────────
         ui_log("Running SAST gate on AI diff...", "SAST")
-        sast_report = run_sast_gate(diff_text, changed_files, REPO_DIR)
+        sast_report = _active_runtime.run_sast(diff_text, changed_files, REPO_DIR)
         log_audit_event("SAST_SCAN", job_id, repo_ref, MODEL, {
             "attempt": attempt_num, "passed": sast_report.passed,
             "findings": len(sast_report.findings), "blocked_reason": sast_report.blocked_reason,
@@ -451,7 +460,7 @@ def process_failing_test(
 
         # ── Step 7: Supply chain gate ────────────────────────────
         ui_log("Running supply chain gate...", "SUPPLY")
-        sc_report = run_supply_chain_gate(diff_text, REPO_DIR)
+        sc_report = _active_runtime.run_supply_chain(diff_text, REPO_DIR)
         log_audit_event("SUPPLY_CHAIN_SCAN", job_id, repo_ref, MODEL, {
             "attempt": attempt_num, "passed": sc_report.passed,
             "new_packages": sc_report.new_packages, "blocked_reason": sc_report.blocked_reason,
@@ -537,7 +546,7 @@ def process_failing_test(
 # ──────────────────────────────────────────────────────────────
 def process_audit_test(
     test_path: str,
-    pytest_bin: str,
+    env_config: EnvConfig,          # ← replaces pytest_bin
     mcp_config_path: str,
     tenant_id: str,
     target_repo: str,
@@ -557,8 +566,8 @@ def process_audit_test(
     job_id = upsert_job(tenant_id, target_repo, test_path, JobStatus.RUNNING)
     ui_log(f"Testing: {test_path} [job:{job_id}]")
 
-    initial_output, pytest_code = run_subprocess_safe(
-        [pytest_bin, test_path, "-v", "--tb=short"], cwd=REPO_DIR, timeout=120, raise_on_error=False
+    initial_output, pytest_code = _active_runtime.run_tests(
+        test_path, REPO_DIR, env_config, timeout=120
     )
 
     if pytest_code == 0:
@@ -575,7 +584,7 @@ def process_audit_test(
     log_audit_event("TEST_FAIL", job_id, target_repo, MODEL, {"test": test_path}, "FAILED")
 
     result = process_failing_test(
-        test_path, initial_output, pytest_bin, mcp_config_path,
+        test_path, initial_output, env_config, mcp_config_path,
         job_id, branch_name, target_repo=target_repo,
     )
 
@@ -644,19 +653,28 @@ def enterprise_audit_loop(repo_override: str = None, branch: str = "main", speci
             ui_log("Syncing to latest origin/main...")
             safe_git_pull()
 
-        pytest_bin = setup_target_venv()
+        # ── Language detection ────────────────────────────────────────
+        global _active_runtime
+        _active_runtime = RuntimeFactory.for_repo(REPO_DIR)
+        ui_log(f"Detected language: {_active_runtime.language.upper()}", "INFO")
 
+        env_config = _active_runtime.setup_env(REPO_DIR, PERSISTENT_DIR)
+
+        # ── Test discovery ────────────────────────────────────────────
         if specific_test:
-            test_files = [os.path.join(REPO_DIR, specific_test)] if os.path.exists(os.path.join(REPO_DIR, specific_test)) else []
+            relative_tests = (
+                [specific_test]
+                if os.path.exists(os.path.join(REPO_DIR, specific_test))
+                else []
+            )
         else:
-            test_files = sorted(glob.glob(f"{REPO_DIR}/**/test_*.py", recursive=True))
+            relative_tests = _active_runtime.discover_tests(REPO_DIR)
 
-        ui_log(f"Discovered {len(test_files)} test file(s).")
+        ui_log(f"Discovered {len(relative_tests)} test file(s) [{_active_runtime.language}].")
 
-        relative_tests = [os.path.relpath(t, REPO_DIR) for t in test_files]
         pool_result = run_parallel_audit(
             relative_tests, process_audit_test,
-            pytest_bin=pytest_bin, mcp_config_path=mcp_config_path,
+            env_config=env_config, mcp_config_path=mcp_config_path,
             tenant_id=TENANT_ID, target_repo=target_repo,
         )
         ui_log(
@@ -673,7 +691,8 @@ def enterprise_audit_loop(repo_override: str = None, branch: str = "main", speci
         if all_green and RED_TEAM_ENABLED and relative_tests:
             ui_log("All tests GREEN — activating Red Team CEGIS.", "RED")
             run_red_team_cegis(
-                repo_dir=REPO_DIR, pytest_bin=pytest_bin,
+                repo_dir=REPO_DIR,
+                env_config=env_config,
                 mcp_config_path=mcp_config_path,
                 blue_team_fn=process_failing_test,
                 tenant_id=TENANT_ID,
@@ -952,7 +971,7 @@ THEME = gr.themes.Base(
     button_primary_text_color="#ffffff",
 )
 
-with gr.Blocks(theme=THEME, title="Rhodawk AI — Code Review Monster") as demo:
+with gr.Blocks(title="Rhodawk AI — Code Review Monster") as demo:
 
     gr.HTML("""
     <div style="padding:20px 0 4px 0; border-bottom:1px solid #1e1e2e; margin-bottom:16px;">
@@ -1007,7 +1026,6 @@ with gr.Blocks(theme=THEME, title="Rhodawk AI — Code Review Monster") as demo:
             inbox_chatbot = gr.Chatbot(
                 label="",
                 height=240,
-                bubble_full_width=False,
                 type="messages",
                 show_label=False,
                 container=True,
@@ -1198,4 +1216,4 @@ if __name__ == "__main__":
     start_webhook_server()
     ui_log("Webhook server running. Launching dashboard...")
     port = int(os.environ.get("PORT", 7860))
-    demo.launch(server_name="0.0.0.0", server_port=port, share=False, show_error=True)
+    demo.launch(server_name="0.0.0.0", server_port=port, share=False, show_error=True, theme=THEME)

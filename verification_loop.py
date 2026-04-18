@@ -20,6 +20,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from typing import Optional
+from language_runtime import RuntimeFactory
 
 MAX_RETRIES = int(os.getenv("RHODAWK_MAX_RETRIES", "5"))
 ADVERSARIAL_REJECTION_MULTIPLIER = int(os.getenv("RHODAWK_ADVERSARIAL_REJECTION_MULTIPLIER", "0"))
@@ -95,14 +96,12 @@ def build_retry_prompt(
                 f"  Fix applied:\n```diff\n{fix.get('fix_diff', '')[:400]}\n```"
             )
 
-    sections.append(
-        f"\nINSTRUCTIONS:\n"
-        f"1. Fix the source code in '{src_file}' or 'requirements.txt' ONLY. Do NOT modify test files.\n"
-        f"2. Use the 'fetch-docs' MCP tool to look up library documentation if needed.\n"
-        f"3. Work on branch '{branch_name}'. Commit the minimal fix when complete.\n"
-        f"4. The fix MUST be different from all previous attempts.\n"
-        f"5. Ensure the fix is minimal and does not introduce regressions."
-    )
+    runtime = RuntimeFactory.for_repo(os.getenv("RHODAWK_REPO_DIR", "/data/repo"))
+    sections.append("INSTRUCTIONS:\n" + runtime.get_fix_prompt_instructions(
+        test_path=test_path,
+        branch_name=branch_name,
+        src_hint=src_file,
+    ))
 
     return "\n".join(sections)
 
@@ -129,13 +128,11 @@ def build_initial_prompt(
                 f"  What worked:\n```diff\n{fix.get('fix_diff', '')[:400]}\n```"
             )
 
-    sections.append(
-        f"\nINSTRUCTIONS:\n"
-        f"1. If there is an import error or version conflict, use 'fetch-docs' MCP to look up "
-        f"   documentation on docs.python.org or pypi.org.\n"
-        f"2. Fix '{src_file}' or 'requirements.txt' to make the test pass. Do NOT modify test files.\n"
-        f"3. Work on branch '{branch_name}'. Commit the minimal fix when complete.\n"
-        f"4. The fix must be minimal and must not introduce regressions."
-    )
+    runtime = RuntimeFactory.for_repo(os.getenv("RHODAWK_REPO_DIR", "/data/repo"))
+    sections.append("INSTRUCTIONS:\n" + runtime.get_fix_prompt_instructions(
+        test_path=test_path,
+        branch_name=branch_name,
+        src_hint=src_file,
+    ))
 
     return "\n".join(sections)
