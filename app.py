@@ -1,5 +1,5 @@
 """
-Rhodawk AI — Autonomous DevSecOps Control Plane v3.0
+Rhodawk AI — Autonomous DevSecOps Control Plane v4.0
 =====================================================
 Full loop:
   1. Clone repo → discover tests → run pytest
@@ -9,10 +9,14 @@ Full loop:
   5. If still failing → retry with new failure context (up to MAX_RETRIES)
   6. SAST gate: bandit + 16-pattern secret scanner
   7. Supply chain gate: pip-audit + typosquatting detection
-  8. Adversarial LLM review: second model plays hostile red-team reviewer
-  9. If adversary REJECTs → loop back with critique as context
-  10. All clear → open PR, record to training store, update memory
-  11. Webhook server runs in parallel for event-driven triggers
+  8. Adversarial LLM review: 3-model concurrent consensus (Qwen∥Gemma∥Mistral)
+  9. Z3 formal verification gate (bounded integer/bounds checking)
+  10. If adversary REJECTs → loop back with critique as context
+  11. Conviction engine: auto-merge if all trust criteria met
+  12. All clear → open PR, record to training store, update memory
+  13. LoRA scheduler: export training data when threshold reached
+  14. Repo harvester: autonomous target selection (antagonist mode)
+  15. Webhook server runs in parallel for event-driven triggers
 """
 
 import hashlib
@@ -32,8 +36,11 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from adversarial_reviewer import run_adversarial_review
 from audit_logger import export_compliance_report, log_audit_event, read_audit_trail, verify_chain_integrity
+from conviction_engine import evaluate_conviction, auto_merge_pr
+from formal_verifier import run_formal_verification
 from github_app import get_github_token
 from job_queue import JobStatus, get_job_status_enum, get_metrics, list_all_jobs, upsert_job
+from lora_scheduler import maybe_trigger_training, get_scheduler_status
 from memory_engine import get_memory_stats, record_fix_outcome, retrieve_similar_fixes
 from embedding_memory import retrieve_similar_fixes_v2
 from notifier import (
@@ -504,6 +511,29 @@ def process_failing_test(
             return VerificationResult(success=False, attempts=attempt_history,
                                       failure_reason="Supply chain gate blocked all attempts")
 
+        # ── Step 7b: Z3 FORMAL VERIFICATION ─────────────────────
+        z3_result = run_formal_verification(diff_text)
+        if z3_result["verdict"] == "UNSAFE":
+            ui_log(f"Z3 formal verification UNSAFE: {z3_result['summary']}", "SAST")
+            log_audit_event("Z3_UNSAFE", job_id, repo_ref, MODEL, {
+                "attempt": attempt_num, "issues": z3_result["issues"],
+                "summary": z3_result["summary"],
+            }, "BLOCKED")
+            record_fix_outcome(current_failure, test_path, diff_text, success=False)
+            run_subprocess_safe(["git", "checkout", "."], cwd=REPO_DIR, raise_on_error=False)
+            issues_text = "\n".join(z3_result["issues"])
+            current_failure = (
+                f"Your previous fix was REJECTED by Z3 formal verification.\n"
+                f"Issues:\n{issues_text}\n\n"
+                f"Original:\n{initial_failure}"
+            )
+            if attempt_num < max_total_attempts:
+                continue
+            return VerificationResult(success=False, attempts=attempt_history,
+                                      failure_reason="Z3 formal verification rejected all attempts")
+        elif z3_result["verdict"] == "SAFE":
+            ui_log(f"Z3: {z3_result['summary']}", "INFO")
+
         # ── Step 8: ADVERSARIAL LLM REVIEW ──────────────────────
         ui_log("Dispatching adversarial reviewer (red team)...", "ADV")
         adv_review = run_adversarial_review(diff_text, test_path, initial_failure, repo_ref)
@@ -627,9 +657,14 @@ def process_audit_test(
 
     if result.success:
         pr_url = ""
+        fork_mode = os.getenv("RHODAWK_FORK_MODE", "false").lower() == "true"
         try:
             if push_fix_branch(branch_name):
-                pr_url = create_github_pr(target_repo, branch_name, test_path, get_github_token(target_repo))
+                from github_app import open_pr_for_repo
+                pr_url = open_pr_for_repo(
+                    target_repo, branch_name, test_path,
+                    get_github_token(target_repo), fork_mode=fork_mode,
+                )
         except Exception as e:
             ui_log(f"PR creation failed for {test_path}: {e}", "WARN")
 
@@ -642,7 +677,45 @@ def process_audit_test(
         ui_log(f"PR submitted for {test_path} (healed in {result.total_attempts} attempt(s))", "PR")
         log_audit_event("PR_SUBMITTED", job_id, target_repo, MODEL,
                         {"test": test_path, "attempts": result.total_attempts,
-                         "branch": branch_name, "pr_url": pr_url}, "SUCCESS")
+                         "branch": branch_name, "pr_url": pr_url,
+                         "fork_mode": fork_mode}, "SUCCESS")
+
+        # ── Conviction auto-merge check ───────────────────────────
+        if pr_url:
+            try:
+                last_adv = {}
+                for attempt in reversed(result.attempts or []):
+                    if hasattr(attempt, "adv_review") and attempt.adv_review:
+                        last_adv = attempt.adv_review
+                        break
+
+                similar = retrieve_similar_fixes_v2(result.final_test_output or "", top_k=5)
+                sast_count = sum(
+                    len(a.sast_findings) if hasattr(a, "sast_findings") else 0
+                    for a in (result.attempts or [])
+                )
+                sc_new_pkgs: list = []
+                should_merge, conviction_reason = evaluate_conviction(
+                    adversarial_review=last_adv,
+                    similar_fixes=similar,
+                    test_attempts=result.total_attempts or 1,
+                    sast_findings_count=sast_count,
+                    new_packages=sc_new_pkgs,
+                )
+                if should_merge:
+                    token = get_github_token(target_repo)
+                    ok, merge_msg = auto_merge_pr(target_repo, pr_url, token)
+                    if ok:
+                        ui_log(f"AUTO-MERGED: {pr_url} ({conviction_reason})", "PR")
+                        log_audit_event("AUTO_MERGE", job_id, target_repo, MODEL,
+                                        {"pr_url": pr_url, "reason": conviction_reason}, "MERGED")
+                    else:
+                        ui_log(f"Auto-merge attempted but failed: {merge_msg}", "WARN")
+                else:
+                    ui_log(f"Conviction not met ({conviction_reason}) — PR requires human review", "INFO")
+            except Exception as e:
+                ui_log(f"Conviction check error (non-blocking): {e}", "WARN")
+
         run_subprocess_safe(["git", "checkout", "main"], cwd=REPO_DIR, raise_on_error=False)
         safe_git_pull()
         return {"success": True, "pr_url": pr_url}
@@ -773,6 +846,13 @@ def enterprise_audit_loop(repo_override: str = None, branch: str = "main", speci
     log_audit_event("AUDIT_COMPLETE", "orchestrator", target_repo, MODEL,
                     {**final_metrics, **training_stats}, "COMPLETE")
 
+    # ── LoRA fine-tune scheduler ──────────────────────────────
+    try:
+        lora_status = maybe_trigger_training()
+        ui_log(lora_status, "INFO")
+    except Exception as e:
+        ui_log(f"LoRA scheduler check failed (non-blocking): {e}", "WARN")
+
     # Update chat inbox with completion notice
     with _inbox_lock:
         m = final_metrics
@@ -861,6 +941,15 @@ def _webhook_dispatch(**kwargs):
         threading.Thread(target=enterprise_audit_loop, kwargs=kwargs, daemon=True).start()
 
 set_job_dispatcher(_webhook_dispatch)
+
+# ──────────────────────────────────────────────────────────────
+# AUTONOMOUS HARVESTER (antagonist mode)
+# ──────────────────────────────────────────────────────────────
+try:
+    from repo_harvester import start_harvester
+    start_harvester(dispatch_fn=_webhook_dispatch)
+except Exception as _e:
+    pass  # harvester is optional — disabled by default
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1198,14 +1287,57 @@ GET  /webhook/queue     — Current job status (JSON)
             swebench_start.click(trigger_swebench_eval, inputs=swebench_count, outputs=swebench_status)
             swebench_refresh.click(get_swebench_display, outputs=swebench_report)
 
-        # ── TAB 8: ARCHITECTURE ───────────────────────────────
+        # ── TAB 8: HARVESTER (Antagonist Mode) ───────────────────
+        with gr.Tab("🌐 Harvester"):
+            gr.Markdown(
+                "### Autonomous Repository Harvester\n"
+                "Scans public GitHub for repos with failing CI and queues them for autonomous healing.\n\n"
+                "**Enable:** set `RHODAWK_HARVESTER_ENABLED=true` in Space Secrets.\n"
+                "**Poll interval:** `RHODAWK_HARVESTER_POLL_SECONDS` (default 21600 = 6h)\n"
+                "**Fork mode:** set `RHODAWK_FORK_MODE=true` to fix repos without push access."
+            )
+            harvester_box = gr.TextArea(label="Harvest Feed", lines=20, interactive=False)
+            gr.Button("🔄 Refresh Feed", variant="secondary").click(
+                fn=lambda: __import__("repo_harvester").get_feed_summary(),
+                outputs=harvester_box,
+            )
+
+        # ── TAB 9: LORA SCHEDULER ─────────────────────────────
+        with gr.Tab("🧬 LoRA Scheduler"):
+            gr.Markdown(
+                "### LoRA Fine-Tune Scheduler\n"
+                "Exports accumulated (failure → fix) pairs in instruction-tuning JSONL format "
+                "when the data threshold is reached.\n\n"
+                "**Enable:** set `RHODAWK_LORA_ENABLED=true`\n"
+                "**Min samples:** `RHODAWK_LORA_MIN_SAMPLES` (default 50)\n"
+                "**Max age:** `RHODAWK_LORA_MAX_AGE_HOURS` (default 168h = 1 week)\n"
+                "**Output:** `/data/lora_exports/lora_training_data_*.jsonl`"
+            )
+            lora_status_box = gr.TextArea(label="Scheduler Status", lines=10, interactive=False)
+            lora_export_btn = gr.Button("⬇ Force Export Now", variant="secondary")
+            lora_result_box = gr.TextArea(label="Export Result", lines=5, interactive=False)
+
+            def _force_lora_export():
+                try:
+                    from lora_scheduler import run_training_export
+                    result = run_training_export()
+                    return str(result)
+                except Exception as e:
+                    return f"Export error: {e}"
+
+            gr.Button("🔄 Refresh Status", variant="secondary").click(
+                get_scheduler_status, outputs=lora_status_box
+            )
+            lora_export_btn.click(_force_lora_export, outputs=lora_result_box)
+
+        # ── TAB 10: ARCHITECTURE ──────────────────────────────
         with gr.Tab("ℹ️ Architecture"):
             compliance_out = gr.Textbox(label="Compliance Export", interactive=False)
             gr.Button("Export SOC 2 Evidence Summary", variant="secondary").click(
                 export_compliance_display, outputs=compliance_out
             )
             gr.Markdown(f"""
-### Rhodawk AI v3.0 — Capability Stack
+### Rhodawk AI v4.0 — Capability Stack
 
 **Tenant:** `{TENANT_ID}` | **Model:** `{MODEL}`
 > Target repo is supplied at runtime via the **Audit Inbox** chat input (no restart required).
@@ -1216,35 +1348,43 @@ GET  /webhook/queue     — Current job status (JSON)
 |---|---|---|
 | AI Agent | Aider + OpenRouter/Qwen | Autonomous patch generation |
 | MCP Tools | fetch-docs, github-manager | Documentation + PR creation |
-| **Verification Loop** | pytest re-run per attempt | **Closes the loop — tests the fix before PR** |
-| **Adversarial Review** | Second LLM (red team) | **Every diff reviewed by a hostile model** |
-| **Memory Engine** | Embeddings + SQLite | **Cross-repo semantic retrieval of similar fixes** |
+| **Verification Loop** | Any-language test re-run per attempt | **Closes the loop — tests the fix before PR** |
+| **Adversarial Review** | 3-model concurrent consensus (Qwen∥Gemma∥Mistral) | **Majority vote, 2/3 threshold** |
+| **Formal Verification** | Z3 SMT solver (bounds + div-by-zero) | **Math-verified integer safety** |
+| **Conviction Engine** | Multi-criteria trust gate | **Auto-merges PRs meeting all safety criteria** |
+| **Memory Engine** | SQLite + optional Qdrant/CodeBERT | **Cross-repo semantic retrieval of similar fixes** |
 | **Supply Chain Gate** | pip-audit + typosquatting + PyPI metadata | **Catches malicious dependencies in AI diffs** |
+| **LoRA Scheduler** | SFT JSONL exporter | **Exports proprietary training data on schedule** |
+| **Repo Harvester** | GitHub search + failing CI detector | **Autonomous target selection (antagonist mode)** |
+| **Fork-and-PR Mode** | Cross-repo PR creation via fork | **Fix any public repo without push access** |
+| **Process Isolation** | multiprocessing.Process per job | **Crash-safe per-test subprocess isolation** |
 | SAST Gate | bandit + semgrep + secret/injection patterns | Pre-PR security scanning |
 | Audit Trail | SHA-256 JSONL chain | SOC 2 / ISO 27001 evidence |
 | Training Store | SQLite (failure→fix→outcome) | Fine-tuning dataset accumulation |
 | Webhook Server | HTTP on :7861 + HMAC + rate limit | Event-driven GitHub/CI triggers |
 | Worker Pool | ThreadPoolExecutor | Parallel audit execution |
+| Language Support | Python / JS / TS / Java / Go / Rust / Ruby | Any-language test healing |
 | SWE-bench Harness | SWE-bench Verified | pass@1 benchmarking reports |
 | Notifications | Telegram + Slack | Multi-channel alerting |
 | Virtualenv | uv | Blazing-fast isolated Python env |
 
 ---
 
-### Git Credential Fix (v3.0)
-The previous `git config --global credential.helper ...` call failed with **exit 255**
-in HuggingFace Spaces because `$HOME/.gitconfig` is not writable at runtime.
-Fix: `configure_git_credentials()` now writes `/tmp/.gitconfig` directly and sets
-`GIT_CONFIG_GLOBAL=/tmp/.gitconfig` in `os.environ` so every child subprocess inherits it.
+### New in v4.0
 
----
+**Peak enhancements:**
+- Concurrent 3-model adversarial consensus (Qwen∥Gemma∥Mistral, 2/3 majority threshold)
+- Z3 SMT solver for bounded formal verification of integer arithmetic and bounds in diffs
+- Qdrant + CodeBERT embedding backend (set `RHODAWK_EMBEDDING_BACKEND=qdrant`)
+- Conviction engine — autonomous merge when all trust criteria are simultaneously satisfied
+- LoRA fine-tune scheduler — automatic training data export when threshold reached
+- Process isolation per test job (`RHODAWK_PROCESS_ISOLATE=true`)
 
-### Roadmap
-- Firecracker microVMs for per-job execution isolation
-- GitHub App rollout across all enterprise tenants
-- Multi-model consensus (3 models, pick majority agreement)
-- Fine-tuned model trained on proprietary failure→fix dataset
-- Distributed job queue (Postgres + worker pool)
+**Antagonist additions:**
+- Repository harvester — scans GitHub for failing CI, queues targets autonomously
+- Fork-and-PR mode — fix any public repo, no push access required (`RHODAWK_FORK_MODE=true`)
+- 24/7 continuous loop via harvester dispatch → audit → heal → PR cycle
+- Public leaderboard (`public_leaderboard.py`) — real numbers, real PRs, no fake metrics
             """)
 
     # ── AUTO-REFRESH ────────────────────────────────────────────
