@@ -90,9 +90,30 @@ def rebuild_embedding_index(limit: int = 1000) -> int:
 def retrieve_similar_fixes_v2(
     failure_output: str,
     top_k: int = 5,
-    min_similarity: float = 0.75,
+    min_similarity: float = 0.55,
 ) -> list[dict]:
+    """
+    BUG-004 FIX:
+      1. min_similarity lowered from 0.75 → 0.55 so sparse/cold-start DBs
+         can still return useful candidates.
+      2. Auto-rebuild embedding index from training_store on cold start
+         (empty index) so v2 memory is never dead on first run.
+      3. Falls back gracefully to empty list (callers handle this).
+    """
     _ensure_schema()
+
+    # Auto-rebuild if the index is empty (cold start)
+    with sqlite3.connect(EMBEDDING_DB_PATH) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM fix_embeddings").fetchone()[0]
+
+    if count == 0:
+        try:
+            rebuilt = rebuild_embedding_index()
+            if rebuilt == 0:
+                return []
+        except Exception:
+            return []
+
     query_vec = embed_failure(failure_output).astype(np.float32)
     with sqlite3.connect(EMBEDDING_DB_PATH) as conn:
         conn.row_factory = sqlite3.Row

@@ -14,6 +14,11 @@ The loop:
   4. If GREEN → gate through adversarial review → open PR
   5. If STILL RED → append new failure + what was tried → goto 2
   6. After MAX_RETRIES → mark as FAILED, escalate
+
+BUG-002 FIX: Removed hardcoded os.getenv("RHODAWK_REPO_DIR") — repo_dir is now
+             passed as a parameter to build_initial_prompt() and build_retry_prompt().
+BUG-003 FIX: ADVERSARIAL_REJECTION_MULTIPLIER defaults to 2 (not 0) so adversarial
+             rejections get extra retry budget beyond MAX_RETRIES.
 """
 
 import os
@@ -23,7 +28,7 @@ from typing import Optional
 from language_runtime import RuntimeFactory
 
 MAX_RETRIES = int(os.getenv("RHODAWK_MAX_RETRIES", "5"))
-ADVERSARIAL_REJECTION_MULTIPLIER = int(os.getenv("RHODAWK_ADVERSARIAL_REJECTION_MULTIPLIER", "0"))
+ADVERSARIAL_REJECTION_MULTIPLIER = int(os.getenv("RHODAWK_ADVERSARIAL_REJECTION_MULTIPLIER", "2"))
 RETRY_BACKOFF_SECONDS = 5
 
 
@@ -55,6 +60,7 @@ def build_retry_prompt(
     original_failure: str,
     attempt_history: list[VerificationAttempt],
     similar_fixes: list[dict],
+    repo_dir: str = "/data/repo",
 ) -> str:
     """
     Build an increasingly rich prompt for each retry attempt.
@@ -96,7 +102,7 @@ def build_retry_prompt(
                 f"  Fix applied:\n```diff\n{fix.get('fix_diff', '')[:400]}\n```"
             )
 
-    runtime = RuntimeFactory.for_repo(os.getenv("RHODAWK_REPO_DIR", "/data/repo"))
+    runtime = RuntimeFactory.for_repo(repo_dir)
     sections.append("INSTRUCTIONS:\n" + runtime.get_fix_prompt_instructions(
         test_path=test_path,
         branch_name=branch_name,
@@ -112,6 +118,7 @@ def build_initial_prompt(
     branch_name: str,
     failure_output: str,
     similar_fixes: list[dict],
+    repo_dir: str = "/data/repo",
 ) -> str:
     sections = []
     sections.append(
@@ -128,7 +135,7 @@ def build_initial_prompt(
                 f"  What worked:\n```diff\n{fix.get('fix_diff', '')[:400]}\n```"
             )
 
-    runtime = RuntimeFactory.for_repo(os.getenv("RHODAWK_REPO_DIR", "/data/repo"))
+    runtime = RuntimeFactory.for_repo(repo_dir)
     sections.append("INSTRUCTIONS:\n" + runtime.get_fix_prompt_instructions(
         test_path=test_path,
         branch_name=branch_name,

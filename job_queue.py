@@ -136,3 +136,33 @@ def get_metrics() -> dict:
         "sast_blocked": sum(1 for j in jobs if j["status"] == "SAST_BLOCKED"),
         "prs_created": sum(1 for j in jobs if j.get("pr_url")),
     }
+
+
+def prune_done_jobs(max_age_hours: int = 72) -> int:
+    """
+    MINOR BUG FIX: Remove DONE/FAILED jobs older than max_age_hours to
+    prevent unbounded job store growth. Safe to call periodically.
+    Returns number of pruned files.
+    """
+    if not os.path.exists(QUEUE_DIR):
+        return 0
+    cutoff = time.time() - (max_age_hours * 3600)
+    pruned = 0
+    with _queue_lock:
+        for fname in os.listdir(QUEUE_DIR):
+            if not fname.endswith(".json"):
+                continue
+            fpath = os.path.join(QUEUE_DIR, fname)
+            try:
+                with open(fpath) as f:
+                    job = json.load(f)
+                if job.get("status") in ("DONE", "FAILED"):
+                    updated_at = job.get("updated_at", "")
+                    if updated_at:
+                        job_ts = time.mktime(time.strptime(updated_at, "%Y-%m-%dT%H:%M:%SZ"))
+                        if job_ts < cutoff:
+                            os.unlink(fpath)
+                            pruned += 1
+            except Exception:
+                pass
+    return pruned

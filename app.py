@@ -49,7 +49,7 @@ from notifier import (
 from sast_gate import run_sast_gate
 from red_team_fuzzer import get_red_team_logs, get_red_team_stats, run_red_team_cegis
 from supply_chain import run_supply_chain_gate
-from training_store import export_training_data, get_statistics, record_attempt, update_test_result
+from training_store import export_training_data, get_statistics, initialize_store, record_attempt, update_test_result
 from verification_loop import (
     MAX_RETRIES,
     ADVERSARIAL_REJECTION_MULTIPLIER,
@@ -62,8 +62,11 @@ from webhook_server import set_job_dispatcher, start_webhook_server
 from worker_pool import MAX_WORKERS, run_parallel_audit
 from language_runtime import RuntimeFactory, LanguageRuntime, EnvConfig
 
-# Module-level runtime handle — set once repo is cloned
+# Module-level runtime handle — set once per audit run.
+# BUG-007 FIX: Protected by a lock so concurrent webhook-triggered audits do not
+# overwrite _active_runtime while workers are mid-flight reading it.
 _active_runtime: LanguageRuntime | None = None
+_active_runtime_lock = threading.Lock()
 
 # ──────────────────────────────────────────────────────────────
 # SECRETS — env only, never hardcoded
@@ -91,6 +94,13 @@ PERSISTENT_DIR = "/data"
 REPO_DIR = f"{PERSISTENT_DIR}/repo"
 VENV_DIR = f"{PERSISTENT_DIR}/target_venv"
 MCP_RUNTIME_CONFIG = "/tmp/mcp_runtime.json"
+
+# ──────────────────────────────────────────────────────────────
+# BUG-005 FIX: Explicit startup initialization — ensures SQLite tables exist
+# even if the module-level call in training_store.py is optimized away or
+# the import order changes in the future.
+# ──────────────────────────────────────────────────────────────
+initialize_store()
 
 # ──────────────────────────────────────────────────────────────
 # GLOBAL STATE
@@ -393,9 +403,9 @@ def process_failing_test(
 
         # ── Step 2: Build prompt ────────────────────────────────
         if attempt_num == 1:
-            prompt = build_initial_prompt(test_path, src_file, branch_name, current_failure, similar_fixes)
+            prompt = build_initial_prompt(test_path, src_file, branch_name, current_failure, similar_fixes, repo_dir=REPO_DIR)
         else:
-            prompt = build_retry_prompt(test_path, src_file, branch_name, initial_failure, attempt_history, similar_fixes)
+            prompt = build_retry_prompt(test_path, src_file, branch_name, initial_failure, attempt_history, similar_fixes, repo_dir=REPO_DIR)
 
         prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:16]
 
@@ -642,6 +652,13 @@ def enterprise_audit_loop(repo_override: str = None, branch: str = "main", speci
     log_audit_event("AUDIT_START", "orchestrator", target_repo, MODEL,
                     {"tenant": TENANT_ID, "branch": branch}, "STARTED")
 
+    # Prune stale completed jobs at the start of each audit run (TTL fix)
+    from job_queue import prune_done_jobs
+    pruned = prune_done_jobs(max_age_hours=72)
+    if pruned:
+        ui_log(f"Pruned {pruned} completed job(s) older than 72h from queue.", "INFO")
+
+    cred_path = "/tmp/.git-credentials"
     try:
         configure_git_credentials()
         mcp_config_path = write_mcp_config()
@@ -654,8 +671,12 @@ def enterprise_audit_loop(repo_override: str = None, branch: str = "main", speci
             safe_git_pull()
 
         # ── Language detection ────────────────────────────────────────
+        # BUG-007 FIX: acquire lock before overwriting _active_runtime so a
+        # concurrent webhook-triggered audit cannot swap the runtime under
+        # in-flight workers from a previous audit.
         global _active_runtime
-        _active_runtime = RuntimeFactory.for_repo(REPO_DIR)
+        with _active_runtime_lock:
+            _active_runtime = RuntimeFactory.for_repo(REPO_DIR)
         ui_log(f"Detected language: {_active_runtime.language.upper()}", "INFO")
 
         env_config = _active_runtime.setup_env(REPO_DIR, PERSISTENT_DIR)
@@ -679,6 +700,7 @@ def enterprise_audit_loop(repo_override: str = None, branch: str = "main", speci
         )
         ui_log(
             f"Worker pool complete — workers={MAX_WORKERS}, healed={pool_result['healed']}, "
+            f"already_green={pool_result['already_green']}, "
             f"failed={pool_result['failed']}, skipped={pool_result['skipped']}",
             "POOL",
         )
@@ -706,6 +728,13 @@ def enterprise_audit_loop(repo_override: str = None, branch: str = "main", speci
         log_audit_event("AUDIT_CRASH", "orchestrator", target_repo, MODEL, {"error": str(e)}, "CRASHED")
         return
     finally:
+        # BUG-008 FIX: Always scrub plaintext credentials from /tmp after audit
+        try:
+            if os.path.exists(cred_path):
+                os.unlink(cred_path)
+                ui_log("Git credentials file scrubbed from /tmp.", "INFO")
+        except OSError:
+            pass
         _audit_event.clear()
 
     final_metrics = get_metrics()

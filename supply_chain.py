@@ -39,18 +39,25 @@ _KNOWN_PACKAGES = {
 _TYPO_THRESHOLD = 2
 
 
-def _levenshtein(s1: str, s2: str) -> int:
-    if len(s1) < len(s2):
-        return _levenshtein(s2, s1)
-    if len(s2) == 0:
-        return len(s1)
-    prev = list(range(len(s2) + 1))
-    for i, c1 in enumerate(s1):
-        curr = [i + 1]
-        for j, c2 in enumerate(s2):
-            curr.append(min(prev[j + 1] + 1, curr[j] + 1, prev[j] + (c1 != c2)))
-        prev = curr
-    return prev[-1]
+try:
+    from rapidfuzz.distance import Levenshtein as _rf_lev
+    def _levenshtein(s1: str, s2: str) -> int:
+        """BUG-010 FIX: Use rapidfuzz C-extension if available (O(n) vs O(n²))."""
+        return _rf_lev.distance(s1, s2)
+except ImportError:
+    def _levenshtein(s1: str, s2: str) -> int:
+        """Pure-Python fallback — O(n²) but correctness-guaranteed."""
+        if len(s1) < len(s2):
+            return _levenshtein(s2, s1)
+        if len(s2) == 0:
+            return len(s1)
+        prev = list(range(len(s2) + 1))
+        for i, c1 in enumerate(s1):
+            curr = [i + 1]
+            for j, c2 in enumerate(s2):
+                curr.append(min(prev[j + 1] + 1, curr[j] + 1, prev[j] + (c1 != c2)))
+            prev = curr
+        return prev[-1]
 
 
 def _extract_new_packages(diff_text: str, original_requirements: str = "") -> list[str]:

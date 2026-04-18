@@ -61,7 +61,18 @@ def get_webhook_log(limit: int = 50) -> list[dict]:
 
 def _verify_github_signature(body: bytes, signature_header: str) -> bool:
     if not WEBHOOK_SECRET:
-        return True  # Skip validation if secret not configured
+        # BUG-006 FIX: Emit a loud warning instead of silently passing all requests.
+        # In production (non-loopback) environments this must be treated as a hard
+        # block so arbitrary internet actors cannot trigger audit jobs.
+        import sys
+        print(
+            "[SECURITY WARNING] RHODAWK_WEBHOOK_SECRET is not set. "
+            "All webhook HMAC validation is DISABLED. Set this secret before "
+            "exposing the webhook endpoint to the internet.",
+            file=sys.stderr,
+        )
+        # Block by default — return False so callers must explicitly whitelist.
+        return False
     if not signature_header or not signature_header.startswith("sha256="):
         return False
     mac = hmac.new(WEBHOOK_SECRET.encode(), msg=body, digestmod=hashlib.sha256)

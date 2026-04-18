@@ -2,6 +2,13 @@
 Rhodawk AI — Concurrent Worker Pool
 ====================================
 ThreadPoolExecutor-based audit orchestration for parallel test healing.
+
+BUG-001 FIX: Updated signature to accept env_config: EnvConfig instead of
+             pytest_bin: str to match app.py's call site. Also fixed BUG-007
+             by removing the global _active_runtime dependency — env_config is
+             passed through as a parameter instead of relying on the global.
+BUG-011 FIX: Tests returning already_green=True are no longer counted as
+             "healed" — they are counted under a separate "already_green" key.
 """
 
 import concurrent.futures
@@ -16,12 +23,12 @@ _pool_lock = threading.Lock()
 def run_parallel_audit(
     test_files: list[str],
     process_fn: Callable,
-    pytest_bin: str,
+    env_config,
     mcp_config_path: str,
     tenant_id: str,
     target_repo: str,
 ) -> dict:
-    results = {"healed": 0, "failed": 0, "skipped": 0, "prs": [], "errors": []}
+    results = {"healed": 0, "failed": 0, "skipped": 0, "already_green": 0, "prs": [], "errors": []}
 
     if not test_files:
         return results
@@ -32,7 +39,7 @@ def run_parallel_audit(
                 _process_one_test,
                 test_path=t,
                 process_fn=process_fn,
-                pytest_bin=pytest_bin,
+                env_config=env_config,
                 mcp_config_path=mcp_config_path,
                 tenant_id=tenant_id,
                 repo=target_repo,
@@ -47,6 +54,10 @@ def run_parallel_audit(
 
             if outcome.get("skipped"):
                 results["skipped"] += 1
+            elif outcome.get("already_green"):
+                results["already_green"] += 1
+                if outcome.get("pr_url"):
+                    results["prs"].append(outcome.get("pr_url"))
             elif outcome.get("success"):
                 results["healed"] += 1
                 if outcome.get("pr_url"):
@@ -62,14 +73,14 @@ def run_parallel_audit(
 def _process_one_test(
     test_path: str,
     process_fn: Callable,
-    pytest_bin: str,
+    env_config,
     mcp_config_path: str,
     tenant_id: str,
     repo: str,
 ) -> dict:
     return process_fn(
         test_path=test_path,
-        pytest_bin=pytest_bin,
+        env_config=env_config,
         mcp_config_path=mcp_config_path,
         tenant_id=tenant_id,
         target_repo=repo,

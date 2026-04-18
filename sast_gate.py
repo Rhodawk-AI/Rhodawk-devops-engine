@@ -182,8 +182,12 @@ def run_sast_gate(diff_text: str, changed_files: list[str], repo_dir: str) -> Sa
             blocked_reason=blocked_reason,
         )
 
-    if len(high_findings) >= 3:
-        blocked_reason = f"{len(high_findings)} HIGH severity findings exceed threshold"
+    # BUG-012 FIX: Block on ANY HIGH severity finding (threshold was erroneously 3).
+    # A single eval(), os.system(), or SQL-injection pattern in AI-generated code is
+    # already a gate failure — two are not acceptable under any DevSecOps policy.
+    HIGH_SEVERITY_THRESHOLD = int(os.getenv("RHODAWK_SAST_HIGH_THRESHOLD", "1"))
+    if len(high_findings) >= HIGH_SEVERITY_THRESHOLD:
+        blocked_reason = f"{len(high_findings)} HIGH severity finding(s) exceed threshold ({HIGH_SEVERITY_THRESHOLD})"
         return SastReport(
             passed=False,
             findings=all_findings,

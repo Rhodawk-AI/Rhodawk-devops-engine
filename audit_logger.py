@@ -107,19 +107,29 @@ def read_audit_trail(limit: int = 50) -> list[dict]:
 
 def verify_chain_integrity() -> tuple[bool, str]:
     """
-    Walk the entire audit chain and verify each entry's hash.
+    Walk the ENTIRE audit chain and verify each entry's hash.
     Returns (is_valid, summary_message).
     Used for compliance attestation.
+
+    MINOR BUG FIX: Previously read_audit_trail(1000) was called which truncated
+    the chain — a log with >1000 entries would appear verified even if early entries
+    were tampered. Now the full file is always read for integrity checks.
     """
     if not os.path.exists(AUDIT_LOG_PATH):
         return True, "No audit log yet — chain is clean."
 
     events = []
-    with open(AUDIT_LOG_PATH, "r") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                events.append(json.loads(line))
+    try:
+        with open(AUDIT_LOG_PATH, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        events.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        return False, f"CHAIN BROKEN: malformed JSON entry at line {len(events) + 1}."
+    except OSError as e:
+        return False, f"Could not read audit log: {e}"
 
     if not events:
         return True, "Empty log — chain is clean."
