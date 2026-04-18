@@ -48,6 +48,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -57,10 +58,13 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, TYPE_CHECKING
 
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential
+
+if TYPE_CHECKING:
+    from language_runtime import EnvConfig
 
 # ──────────────────────────────────────────────────────────────
 # CONFIGURATION & SECRETS
@@ -117,6 +121,63 @@ def rte_log(message: str, level: str = "INFO") -> None:
 def get_red_team_logs(n: int = 100) -> str:
     with _rt_log_lock:
         return "\n".join(_rt_logs[-n:])
+
+
+# ──────────────────────────────────────────────────────────────
+# ENV CONFIG BINARY RESOLVERS
+# Extracts concrete binary paths from an EnvConfig object so the
+# fuzzing subprocess calls can work regardless of language runtime.
+# ──────────────────────────────────────────────────────────────
+
+def _get_runner_bin(env_config: "EnvConfig") -> str:
+    """
+    Resolve the pytest-compatible test runner binary from an EnvConfig.
+    Tries common attribute names, then venv_dir derivation, then system PATH.
+    """
+    for attr in ("runner_bin", "pytest_bin", "test_bin"):
+        val = getattr(env_config, attr, None)
+        if val and os.path.isfile(str(val)):
+            return str(val)
+    venv_dir = getattr(env_config, "venv_dir", None)
+    if venv_dir:
+        candidate = os.path.join(str(venv_dir), "bin", "pytest")
+        if os.path.isfile(candidate):
+            return candidate
+    return shutil.which("pytest") or "pytest"
+
+
+def _get_python_bin(env_config: "EnvConfig") -> str:
+    """
+    Resolve the Python interpreter binary from an EnvConfig.
+    Falls back to the current process interpreter.
+    """
+    for attr in ("python_bin", "interpreter", "python"):
+        val = getattr(env_config, attr, None)
+        if val and os.path.isfile(str(val)):
+            return str(val)
+    venv_dir = getattr(env_config, "venv_dir", None)
+    if venv_dir:
+        candidate = os.path.join(str(venv_dir), "bin", "python")
+        if os.path.isfile(candidate):
+            return candidate
+    return sys.executable
+
+
+def _get_pip_bin(env_config: "EnvConfig") -> str:
+    """
+    Resolve the pip binary from an EnvConfig.
+    Falls back to pip in the same venv, then system pip.
+    """
+    for attr in ("pip_bin", "pip"):
+        val = getattr(env_config, attr, None)
+        if val and os.path.isfile(str(val)):
+            return str(val)
+    venv_dir = getattr(env_config, "venv_dir", None)
+    if venv_dir:
+        candidate = os.path.join(str(venv_dir), "bin", "pip")
+        if os.path.isfile(candidate):
+            return candidate
+    return shutil.which("pip") or "pip"
 
 
 # ──────────────────────────────────────────────────────────────
@@ -215,10 +276,6 @@ def _compute_cyclomatic_complexity(source: str) -> float:
         pass
 
     # Fallback: count decision points
-    branch_keywords = {
-        "if", "elif", "for", "while", "except", "with",
-        "and", "or", "not", "assert",
-    }
     score = 1.0
     try:
         tree = ast.parse(source)
@@ -409,8 +466,6 @@ def analyze_repository_ast(repo_dir: str) -> list[FuzzTarget]:
     rte_log(f"Scanning AST of repository: {repo_dir}", "AST")
 
     targets: list[FuzzTarget] = []
-    source_dirs = ["src", "lib", "core", "app", "utils", "engine", "api"]
-
     candidate_files: list[Path] = []
     repo_path = Path(repo_dir)
 
@@ -440,20 +495,17 @@ def analyze_repository_ast(repo_dir: str) -> list[FuzzTarget]:
             rte_log(f"SyntaxError in {rel_path}: {e}", "WARN")
             continue
 
-        # Extract module-level source lines for function slicing
         source_lines = source.splitlines()
 
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            # Skip private/dunder/tiny functions
             name = node.name
             if name.startswith("__") and name.endswith("__"):
                 continue
             if not node.args.args and not node.args.vararg:
                 continue  # No arguments = nothing to fuzz
 
-            # Extract function source
             try:
                 fn_start = node.lineno - 1
                 fn_end = node.end_lineno if hasattr(node, "end_lineno") else fn_start + 30
@@ -464,7 +516,6 @@ def analyze_repository_ast(repo_dir: str) -> list[FuzzTarget]:
             if len(fn_source.strip()) < 20:
                 continue
 
-            # Build signature string
             try:
                 sig = ast.unparse(node) if hasattr(ast, "unparse") else name
                 sig = sig.split("\n")[0].rstrip(":")
@@ -473,17 +524,11 @@ def analyze_repository_ast(repo_dir: str) -> list[FuzzTarget]:
             except Exception:
                 sig = f"def {name}(...)"
 
-            # Extract docstring
             docstring = ast.get_docstring(node) or ""
-
-            # Extract arg types and return type
             arg_types = _extract_arg_types(node)
             return_type = _extract_return_type(node)
-
-            # Compute complexity on the function slice only
             complexity = _compute_cyclomatic_complexity(fn_source)
 
-            # Feature flags
             has_loops = any(
                 isinstance(n, (ast.For, ast.While, ast.AsyncFor))
                 for n in ast.walk(node)
@@ -526,15 +571,17 @@ def analyze_repository_ast(repo_dir: str) -> list[FuzzTarget]:
                 attack_rationale=rationale,
             ))
 
-    # Sort by priority descending
     targets.sort(key=lambda t: t.attack_priority, reverse=True)
 
-    rte_log(
-        f"AST analysis complete: {len(targets)} attack targets ranked. "
-        f"Top target: {targets[0].profile.function_name if targets else 'none'} "
-        f"(score={targets[0].attack_priority:.3f})" if targets else "No targets found.",
-        "AST"
-    )
+    if targets:
+        rte_log(
+            f"AST analysis complete: {len(targets)} attack targets ranked. "
+            f"Top target: {targets[0].profile.function_name} "
+            f"(score={targets[0].attack_priority:.3f})",
+            "AST"
+        )
+    else:
+        rte_log("AST analysis complete: No targets found.", "AST")
 
     return targets[:MAX_TARGETS_PER_RUN]
 
@@ -666,16 +713,17 @@ def _clean_llm_test_output(raw: str) -> str:
     Strip markdown fences and extract raw Python from LLM response.
     The LLM is instructed not to use markdown, but be defensive.
     """
-    # Remove ```python ... ``` blocks
     raw = re.sub(r"```(?:python)?\s*\n?", "", raw)
     raw = re.sub(r"```\s*$", "", raw, flags=re.MULTILINE)
-    # Remove leading/trailing commentary lines that aren't Python
     lines = raw.splitlines()
     code_lines = []
     in_code = False
     for line in lines:
         stripped = line.strip()
-        if stripped.startswith("#") or stripped.startswith("import") or stripped.startswith("from") or stripped.startswith("def ") or stripped.startswith("@") or stripped.startswith("    ") or stripped == "" or in_code:
+        if (stripped.startswith("#") or stripped.startswith("import") or
+                stripped.startswith("from") or stripped.startswith("def ") or
+                stripped.startswith("@") or stripped.startswith("    ") or
+                stripped == "" or in_code):
             in_code = True
             code_lines.append(line)
         elif in_code:
@@ -707,7 +755,6 @@ def synthesize_pbt(
         raw_response = _call_red_team_llm(_RED_TEAM_SYSTEM_PROMPT, user_prompt, model)
     except Exception as e:
         rte_log(f"LLM call failed for {target.profile.function_name}: {e}", "WARN")
-        # Fallback to strong model on failure
         if not use_strong_model:
             try:
                 raw_response = _call_red_team_llm(
@@ -721,7 +768,6 @@ def synthesize_pbt(
 
     test_code = _clean_llm_test_output(raw_response)
 
-    # Validate it looks like Python with hypothesis
     if "from hypothesis" not in test_code and "import hypothesis" not in test_code:
         rte_log(
             f"LLM output for {target.profile.function_name} doesn't contain hypothesis imports — retrying",
@@ -730,20 +776,17 @@ def synthesize_pbt(
         return None
 
     if "def test_" not in test_code:
-        rte_log(f"LLM output missing test function — retrying", "WARN")
+        rte_log("LLM output missing test function — retrying", "WARN")
         return None
 
-    # Extract test function name
     fn_match = re.search(r"def (test_\w+)\(", test_code)
     test_fn_name = fn_match.group(1) if fn_match else "test_invariant"
 
-    # Extract invariant description from docstring or comment
     inv_match = re.search(r'"""([^"]{10,200}?)"""', test_code)
     if not inv_match:
         inv_match = re.search(r"#\s*(.{10,120})", test_code)
     invariant_desc = inv_match.group(1).strip() if inv_match else "property invariant"
 
-    # Extract hypothesis strategy
     strategy_match = re.search(r"@given\((.{5,200}?)\)", test_code)
     strategy = strategy_match.group(1) if strategy_match else "unknown"
 
@@ -767,11 +810,15 @@ def synthesize_pbt(
 # SECTION 3: DETERMINISTIC FUZZING LOOP
 # ──────────────────────────────────────────────────────────────
 
-def _install_hypothesis_if_needed(pytest_bin: str, repo_dir: str) -> bool:
-    """Ensure hypothesis is installed in the target venv."""
+def _install_hypothesis_if_needed(env_config: "EnvConfig", repo_dir: str) -> bool:
+    """
+    Ensure hypothesis is installed in the target environment.
+    Uses EnvConfig to resolve the correct python/pip binaries.
+    """
+    python_bin = _get_python_bin(env_config)
     try:
         check = subprocess.run(
-            [pytest_bin.replace("pytest", "python"), "-c", "import hypothesis"],
+            [python_bin, "-c", "import hypothesis"],
             capture_output=True, timeout=15, cwd=repo_dir,
         )
         if check.returncode == 0:
@@ -779,9 +826,9 @@ def _install_hypothesis_if_needed(pytest_bin: str, repo_dir: str) -> bool:
     except Exception:
         pass
 
-    rte_log("Installing hypothesis into target venv...", "FUZZ")
+    rte_log("Installing hypothesis into target env...", "FUZZ")
+    pip_bin = _get_pip_bin(env_config)
     try:
-        pip_bin = pytest_bin.replace("pytest", "pip")
         result = subprocess.run(
             [pip_bin, "install", "hypothesis", "--quiet"],
             capture_output=True, timeout=120, cwd=repo_dir,
@@ -846,7 +893,6 @@ def _extract_falsifying_example(output: str) -> str:
         if m:
             return m.group(1).strip()[:500]
 
-    # Fallback: extract any exception line
     for line in output.splitlines():
         if "Error" in line or "assert" in line.lower():
             return line.strip()[:300]
@@ -870,7 +916,7 @@ def _extract_crash_type(output: str) -> str:
         return "type_error"
     if "ValueError" in output:
         return "value_error"
-    if "MemoryError" in output or "MemoryError" in output:
+    if "MemoryError" in output:          # FIX: was duplicated "MemoryError in output or MemoryError in output"
         return "memory_exhaustion"
     if "FAILED" in output:
         return "assertion"
@@ -885,7 +931,6 @@ def _extract_survived_inputs(output: str) -> list[str]:
     survived = []
     for m in re.finditer(r"Trying example.*?\((.+?)\)", output):
         survived.append(m.group(1)[:100])
-    # Also include any explicit example lines
     for m in re.finditer(r"explicit example.*?\((.+?)\)", output, re.IGNORECASE):
         survived.append(m.group(1)[:100])
     return survived[:20]
@@ -895,7 +940,7 @@ def run_fuzzing_loop(
     pbt: GeneratedPBT,
     target: FuzzTarget,
     repo_dir: str,
-    pytest_bin: str,
+    env_config: "EnvConfig",          # FIX: was pytest_bin: str
 ) -> tuple[bool, str, str]:
     """
     Execute the generated PBT via subprocess with hypothesis aggressive settings.
@@ -905,8 +950,8 @@ def run_fuzzing_loop(
 
     Security: shell=False enforced, secrets stripped from env, SIGKILL on timeout.
     """
-    # Write test file
     test_file = _write_pbt_to_file(pbt, target, repo_dir)
+    pytest_bin = _get_runner_bin(env_config)
 
     rte_log(
         f"Fuzzing: {target.profile.function_name} | "
@@ -915,7 +960,6 @@ def run_fuzzing_loop(
         "FUZZ"
     )
 
-    # Build environment — secrets stripped, hypothesis settings injected
     env = os.environ.copy()
     for secret_key in [
         "OPENROUTER_API_KEY", "GITHUB_TOKEN", "GITHUB_PERSONAL_ACCESS_TOKEN",
@@ -923,10 +967,8 @@ def run_fuzzing_loop(
     ]:
         env.pop(secret_key, None)
 
-    # Hypothesis configuration via env (overrides @settings decorator)
     env["HYPOTHESIS_MAX_EXAMPLES"] = str(FUZZ_MAX_EXAMPLES)
     env["HYPOTHESIS_VERBOSITY"] = "verbose"
-    # Deterministic but varied seed per CEGIS round
     seed = (hash(target.profile.function_name) + pbt.cegis_round * 7919) % (2**31)
     env["HYPOTHESIS_SEED"] = str(abs(seed))
 
@@ -937,7 +979,7 @@ def run_fuzzing_loop(
         "--tb=long",
         "--no-header",
         f"--hypothesis-seed={abs(seed)}",
-        "-x",  # Stop at first failure
+        "-x",
     ]
 
     proc = None
@@ -990,7 +1032,6 @@ def run_fuzzing_loop(
         rte_log(f"Fuzzing subprocess error for {target.profile.function_name}: {e}", "FAIL")
         return False, str(e), ""
     finally:
-        # Clean up test file if no crash (keep if crash for audit trail)
         if proc and proc.returncode == 0:
             try:
                 os.unlink(test_file)
@@ -1013,8 +1054,6 @@ def _build_synthetic_failing_test(crash: CrashPayload, repo_dir: str) -> str:
     p = crash.target.profile
     example = crash.falsifying_example
 
-    # Parse the falsifying example into argument assignments
-    # hypothesis formats it as: x=42, y=-1, s='hello'
     arg_setup_lines = []
     example_clean = example.strip().rstrip(")")
     for part in re.split(r",\s*(?=[a-zA-Z_]\w*=)", example_clean):
@@ -1023,9 +1062,8 @@ def _build_synthetic_failing_test(crash: CrashPayload, repo_dir: str) -> str:
             arg_setup_lines.append(f"    {part}")
 
     if not arg_setup_lines:
-        # Fallback: use the raw example as a comment
         arg_setup_lines = [f"    # Falsifying example: {example}"]
-        arg_call = ", ".join(f"None" for _ in p.arg_types)
+        arg_call = ", ".join("None" for _ in p.arg_types)
     else:
         arg_call = ", ".join(
             part.strip().split("=")[0] for part in arg_setup_lines if "=" in part
@@ -1082,8 +1120,6 @@ def _build_synthetic_failing_test(crash: CrashPayload, repo_dir: str) -> str:
             # Blue Team: fix the implementation so this assertion holds for all inputs
             try:
                 result = {p.function_name}({arg_call})
-                # If the crash was an assertion in the PBT, re-check the invariant
-                # The Blue Team must make this deterministic test pass
                 assert result is not None or result is None, (
                     f"Function returned unexpected result: {{result!r}}"
                 )
@@ -1115,7 +1151,6 @@ def package_crash_for_blue_team(
     crash_hash = hashlib.sha256(crash_raw.encode()).hexdigest()[:16]
     crash_type = _extract_crash_type(crash_output)
 
-    # Write synthetic deterministic failing test
     fn_safe = target.profile.function_name.replace("-", "_")
     synthetic_filename = f"test_rt_zero_day_{fn_safe}_{crash_hash}.py"
     synthetic_path = os.path.join(RED_TEAM_DIR, synthetic_filename)
@@ -1151,7 +1186,7 @@ def package_crash_for_blue_team(
 def handoff_to_blue_team(
     crash: CrashPayload,
     repo_dir: str,
-    pytest_bin: str,
+    env_config: "EnvConfig",           # FIX: was pytest_bin: str
     mcp_config_path: str,
     job_id: str,
     branch_name: str,
@@ -1170,7 +1205,9 @@ def handoff_to_blue_team(
         "HAND"
     )
 
-    # First verify the synthetic test actually fails (confirms reproducibility)
+    pytest_bin = _get_runner_bin(env_config)
+
+    # Verify synthetic test actually fails (confirms reproducibility)
     env = os.environ.copy()
     for secret_key in ["OPENROUTER_API_KEY", "GITHUB_TOKEN", "GITHUB_PERSONAL_ACCESS_TOKEN"]:
         env.pop(secret_key, None)
@@ -1188,8 +1225,8 @@ def handoff_to_blue_team(
 
     if verify_proc.returncode == 0:
         rte_log(
-            f"WARNING: Synthetic test PASSED on first run — crash may not be deterministic. "
-            f"Reporting anyway for human review.",
+            "WARNING: Synthetic test PASSED on first run — crash may not be deterministic. "
+            "Reporting anyway for human review.",
             "WARN"
         )
         initial_failure_output = (
@@ -1198,17 +1235,14 @@ def handoff_to_blue_team(
             f"Falsifying example: {crash.falsifying_example}"
         )
 
-    # Relative path of the synthetic test within repo context
     rel_synthetic_test = os.path.relpath(crash.synthetic_test_path, repo_dir)
-
     rte_log(f"Dispatching Blue Team on: {rel_synthetic_test}", "HAND")
 
-    # Call the Blue Team process_failing_test function
     try:
-        blue_result = blue_team_fn(
+        blue_result = blue_team_fn(                # FIX: was pytest_bin=pytest_bin
             test_path=rel_synthetic_test,
             initial_failure=initial_failure_output,
-            pytest_bin=pytest_bin,
+            env_config=env_config,
             mcp_config_path=mcp_config_path,
             job_id=job_id,
             branch_name=branch_name,
@@ -1254,7 +1288,7 @@ def handoff_to_blue_team(
 
 def run_red_team_cegis(
     repo_dir: str,
-    pytest_bin: str,
+    env_config: "EnvConfig",           # FIX: was pytest_bin: str
     mcp_config_path: str,
     blue_team_fn: Callable,
     tenant_id: str = "default",
@@ -1269,7 +1303,7 @@ def run_red_team_cegis(
 
     Args:
         repo_dir: Absolute path to the cloned target repository
-        pytest_bin: Path to pytest binary in the isolated venv
+        env_config: EnvConfig from language_runtime — provides test runner, python, pip
         mcp_config_path: Path to MCP runtime config for Blue Team Aider
         blue_team_fn: process_failing_test() from app.py (Blue Team entry point)
         tenant_id: Namespace for job queue
@@ -1283,8 +1317,8 @@ def run_red_team_cegis(
 
     result = RedTeamResult(repo_dir=repo_dir, targets_analyzed=0)
 
-    # Ensure hypothesis is available
-    if not _install_hypothesis_if_needed(pytest_bin, repo_dir):
+    # Ensure hypothesis is available in the target environment
+    if not _install_hypothesis_if_needed(env_config, repo_dir):
         rte_log("hypothesis not available — Red Team cannot run without it", "FAIL")
         return result
 
@@ -1331,7 +1365,6 @@ def run_red_team_cegis(
         for cegis_round in range(1, MAX_CEGIS_ROUNDS + 1):
             rte_log(f"CEGIS round {cegis_round}/{MAX_CEGIS_ROUNDS} for {target.profile.function_name}", "CEGIS")
 
-            # Synthesize PBT — use strong model on final rounds
             use_strong = (cegis_round >= MAX_CEGIS_ROUNDS - 1)
             pbt = synthesize_pbt(target, cegis_round, survived_inputs, use_strong)
 
@@ -1342,13 +1375,11 @@ def run_red_team_cegis(
             result.total_fuzz_examples += FUZZ_MAX_EXAMPLES
             result.cegis_rounds += 1
 
-            # Run the fuzzer
             crashed, crash_output, falsifying_example = run_fuzzing_loop(
-                pbt, target, repo_dir, pytest_bin
+                pbt, target, repo_dir, env_config    # FIX: was pytest_bin
             )
 
             if crashed and falsifying_example != "timeout":
-                # CRASH FOUND — package and hand off to Blue Team
                 crash_payload = package_crash_for_blue_team(
                     target=target,
                     pbt=pbt,
@@ -1379,7 +1410,6 @@ def run_red_team_cegis(
                         f"Handing to Blue Team for autonomous patching..."
                     )
 
-                # CEGIS HANDOFF — dispatch Blue Team
                 job_id_rt = hashlib.sha256(
                     f"{repo_dir}:{target.profile.function_name}:{crash_payload.crash_hash}".encode()
                 ).hexdigest()[:16]
@@ -1391,7 +1421,7 @@ def run_red_team_cegis(
                 handoff_result = handoff_to_blue_team(
                     crash=crash_payload,
                     repo_dir=repo_dir,
-                    pytest_bin=pytest_bin,
+                    env_config=env_config,             # FIX: was pytest_bin=pytest_bin
                     mcp_config_path=mcp_config_path,
                     job_id=job_id_rt,
                     branch_name=branch_name_rt,
@@ -1408,7 +1438,6 @@ def run_red_team_cegis(
                 break
 
             else:
-                # No crash — feed survived inputs back for next CEGIS round
                 new_survived = _extract_survived_inputs(crash_output)
                 survived_inputs.extend(new_survived)
                 survived_inputs = survived_inputs[:30]
