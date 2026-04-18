@@ -253,17 +253,26 @@ class PythonRuntime(LanguageRuntime):
         # In HuggingFace Spaces /data is a mounted volume that may not be pre-created.
         os.makedirs(persistent_dir, exist_ok=True)
 
+        # FIX: redirect uv cache to /tmp which is always writable in HuggingFace Spaces.
+        # Without this, uv fails with "Permission denied" on /home/rhodawk/.cache/uv
+        # and silently skips package installation, causing all tests to fail on import.
+        uv_env = {"UV_CACHE_DIR": "/tmp/uv-cache"}
+
+        pytest_bin_check = os.path.join(venv_dir, "bin", "pytest")
+        # FIX: if venv exists but pytest is missing, the previous install was broken
+        # (e.g. uv pip install silently failed due to cache permission error).
+        # Force a clean rebuild so packages are properly installed this run.
+        if os.path.exists(venv_dir) and not os.path.exists(pytest_bin_check):
+            import shutil
+            shutil.rmtree(venv_dir, ignore_errors=True)
+
         if not os.path.exists(venv_dir):
-            # FIX: pass --python explicitly so uv never has to auto-resolve a Python
-            # interpreter.  Without this flag, uv exits 2 when UV_PYTHON is absent or
-            # the managed-Python toolchain cache is cold (common in Space restarts).
             out, code = self._run(
                 ["uv", "venv", "--python", sys.executable, venv_dir],
                 cwd="/tmp",
+                extra_env=uv_env,
             )
             if code != 0:
-                # FIX: graceful fallback to stdlib venv — always available because we
-                # are already running inside the correct interpreter.
                 ui_msg = (
                     f"uv venv failed (exit {code}) — falling back to "
                     f"python -m venv. uv output: {out.strip()[:200]}"
@@ -276,20 +285,31 @@ class PythonRuntime(LanguageRuntime):
                     raise_on_error=True,
                 )
 
-        req_path = os.path.join(repo_dir, "requirements.txt")
-        if os.path.exists(req_path):
-            self._run(
-                ["uv", "pip", "install", "--python", venv_dir, "--quiet", "-r", req_path],
-                cwd=repo_dir, timeout=600,
+        pip_bin = os.path.join(venv_dir, "bin", "pip")
+
+        def _install_deps(args: list[str]) -> bool:
+            """Try uv pip install first; fall back to pip on failure."""
+            out, code = self._run(
+                ["uv", "pip", "install", "--python", venv_dir, "--quiet"] + args,
+                cwd=repo_dir, timeout=600, extra_env=uv_env,
             )
-        else:
-            # Try pyproject.toml / setup.py
-            pyproject = os.path.join(repo_dir, "pyproject.toml")
-            if os.path.exists(pyproject):
-                self._run(
-                    ["uv", "pip", "install", "--python", venv_dir, "--quiet", "-e", ".[dev,test]"],
+            if code != 0:
+                import warnings
+                warnings.warn(f"uv pip install failed (exit {code}) — falling back to pip. {out.strip()[:200]}")
+                _, pip_code = self._run(
+                    [pip_bin, "install", "--quiet"] + args,
                     cwd=repo_dir, timeout=600,
                 )
+                return pip_code == 0
+            return True
+
+        req_path = os.path.join(repo_dir, "requirements.txt")
+        if os.path.exists(req_path):
+            _install_deps(["-r", req_path])
+        else:
+            pyproject = os.path.join(repo_dir, "pyproject.toml")
+            if os.path.exists(pyproject):
+                _install_deps(["-e", ".[dev,test]"])
 
         pytest_bin = os.path.join(venv_dir, "bin", "pytest")
         return EnvConfig(
