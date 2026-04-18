@@ -116,8 +116,8 @@ dashboard_logs: list[str] = []
 _log_lock = threading.Lock()
 _audit_event = threading.Event()
 
-# Chat inbox state — list of (user_msg, bot_reply) tuples
-_inbox_history: list[tuple[str, str]] = []
+# Chat inbox state — list of {"role": ..., "content": ...} dicts
+_inbox_history: list[dict] = []
 _inbox_lock = threading.Lock()
 
 
@@ -856,15 +856,18 @@ def enterprise_audit_loop(repo_override: str = None, branch: str = "main", speci
     # Update chat inbox with completion notice
     with _inbox_lock:
         m = final_metrics
-        _inbox_history.append((
-            f"✅ Audit complete: `{target_repo}`",
-            f"**Audit finished.**\n"
-            f"- Tests scanned: {m['total']}\n"
-            f"- Verified green: {m['done']}\n"
-            f"- PRs generated: {m['prs_created']}\n"
-            f"- SAST blocked: {m['sast_blocked']}\n"
-            f"- Fix rate: {training_stats['fix_success_rate']}"
-        ))
+        _inbox_history.append({"role": "user", "content": f"✅ Audit complete: `{target_repo}`"})
+        _inbox_history.append({
+            "role": "assistant",
+            "content": (
+                f"**Audit finished.**\n"
+                f"- Tests scanned: {m['total']}\n"
+                f"- Verified green: {m['done']}\n"
+                f"- PRs generated: {m['prs_created']}\n"
+                f"- SAST blocked: {m['sast_blocked']}\n"
+                f"- Fix rate: {training_stats['fix_success_rate']}"
+            )
+        })
 
 
 # ──────────────────────────────────────────────────────────────
@@ -874,23 +877,26 @@ def submit_repo_audit(repo_input: str, chat_history: list) -> tuple[list, str]:
     """
     Called when user submits a repo via the chat inbox.
     Validates, kicks off the audit in a background thread, and
-    returns an updated chat history.
+    returns an updated chat history using the messages format.
     """
     repo = (repo_input or "").strip()
 
     if not repo:
         return chat_history + [
-            ("(empty)", "⚠️ Please enter a repository in the format `owner/repo`."),
+            {"role": "user", "content": "(empty)"},
+            {"role": "assistant", "content": "⚠️ Please enter a repository in the format `owner/repo`."},
         ], ""
 
     if "/" not in repo or len(repo.split("/")) != 2:
         return chat_history + [
-            (repo, f'❌ Invalid format: `{repo}`\nUse `owner/repo` — e.g. `MogasalaHemagiri/Multi-Agent-Code-Stabilizer`'),
+            {"role": "user", "content": repo},
+            {"role": "assistant", "content": f'❌ Invalid format: `{repo}`\nUse `owner/repo` — e.g. `MogasalaHemagiri/Multi-Agent-Code-Stabilizer`'},
         ], repo
 
     if _audit_event.is_set():
         return chat_history + [
-            (repo, "⚠️ An audit is already running. Please wait for it to complete before submitting another repo."),
+            {"role": "user", "content": repo},
+            {"role": "assistant", "content": "⚠️ An audit is already running. Please wait for it to complete before submitting another repo."},
         ], ""
 
     _audit_event.set()
@@ -901,22 +907,23 @@ def submit_repo_audit(repo_input: str, chat_history: list) -> tuple[list, str]:
     ).start()
 
     return chat_history + [
-        (
-            f"🎯 Audit: `{repo}`",
-            (
+        {"role": "user", "content": f"🎯 Audit: `{repo}`"},
+        {
+            "role": "assistant",
+            "content": (
                 f"🚀 **Audit started for `{repo}`**\n\n"
                 f"Watch the **Live Agent Log** below for real-time progress.\n"
                 f"I'll post results here when the audit completes.\n\n"
                 f"_Model: `{MODEL}` · Tenant: `{TENANT_ID}`_"
             ),
-        ),
+        },
     ], ""
 
 
 def get_inbox_history() -> list:
     """Pull any background-posted messages (e.g. audit-complete) into the chat."""
     with _inbox_lock:
-        msgs = [(u, b) for u, b in _inbox_history]
+        msgs = list(_inbox_history)
         _inbox_history.clear()
     return msgs or []
 
@@ -1176,6 +1183,7 @@ with gr.Blocks(title="Rhodawk AI — Code Review Monster") as demo:
                 label="",
                 height=240,
                 show_label=False,
+                type="messages",
             )
 
             with gr.Row():
