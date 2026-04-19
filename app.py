@@ -1733,7 +1733,7 @@ THEME = gr.themes.Base(
     button_primary_text_color="#ffffff",
 )
 
-with gr.Blocks(title="Rhodawk AI — Code Review Monster") as demo:
+with gr.Blocks(title="Rhodawk AI — Code Review Monster", theme=THEME) as demo:
 
     gr.HTML("""
     <div style="padding:20px 0 4px 0; border-bottom:1px solid #1e1e2e; margin-bottom:16px;">
@@ -1789,6 +1789,7 @@ with gr.Blocks(title="Rhodawk AI — Code Review Monster") as demo:
                 label="",
                 height=240,
                 show_label=False,
+                type="messages",
             )
 
             with gr.Row():
@@ -2307,4 +2308,4 @@ if __name__ == "__main__":
     start_webhook_server()
     ui_log("Webhook server running. Launching dashboard...")
     port = int(os.environ.get("PORT", 7860))
-    demo.launch(server_name="0.0.0.0", server_port=port, share=False, show_error=True, theme=THEME)
+    demo.launch(server_name="0.0.0.0", server_port=port, share=False, show_error=True)
