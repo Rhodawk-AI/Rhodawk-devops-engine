@@ -39,13 +39,41 @@ import glob
 import json
 import os
 import re
+import signal
+import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+
+_runtime_process_groups: set[int] = set()
+_runtime_process_lock = threading.Lock()
+
+
+def kill_runtime_processes() -> int:
+    with _runtime_process_lock:
+        groups = list(_runtime_process_groups)
+        _runtime_process_groups.clear()
+    killed = 0
+    for pgid in groups:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+            killed += 1
+        except ProcessLookupError:
+            continue
+    time.sleep(0.2)
+    for pgid in groups:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            continue
+    return killed
+
 
 # ──────────────────────────────────────────────────────────────
 # SHARED DATA STRUCTURES
@@ -213,21 +241,41 @@ class LanguageRuntime(ABC):
             env.pop(secret, None)
         if extra_env:
             env.update(extra_env)
+        proc = None
+        pgid = None
         try:
             proc = subprocess.Popen(
                 cmd, shell=False, cwd=cwd,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, env=env,
+                text=True, env=env, start_new_session=True,
             )
+            try:
+                pgid = os.getpgid(proc.pid)
+                with _runtime_process_lock:
+                    _runtime_process_groups.add(pgid)
+            except ProcessLookupError:
+                pgid = None
             stdout, stderr = proc.communicate(timeout=timeout)
             output = (stdout or "") + "\n" + (stderr or "")
             if raise_on_error and proc.returncode != 0:
                 raise subprocess.CalledProcessError(proc.returncode, cmd)
             return output, proc.returncode
+        except FileNotFoundError as e:
+            if raise_on_error:
+                raise
+            return str(e), 127
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.communicate()
+            if proc:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.communicate()
             return f"[TIMEOUT after {timeout}s]", 1
+        finally:
+            if pgid is not None:
+                with _runtime_process_lock:
+                    _runtime_process_groups.discard(pgid)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -263,21 +311,24 @@ class PythonRuntime(LanguageRuntime):
         # Without this, uv fails with "Permission denied" on /home/rhodawk/.cache/uv
         # and silently skips package installation, causing all tests to fail on import.
         uv_env = {"UV_CACHE_DIR": "/tmp/uv-cache"}
+        uv_bin = shutil.which("uv")
 
         pytest_bin_check = os.path.join(venv_dir, "bin", "pytest")
         # FIX: if venv exists but pytest is missing, the previous install was broken
         # (e.g. uv pip install silently failed due to cache permission error).
         # Force a clean rebuild so packages are properly installed this run.
         if os.path.exists(venv_dir) and not os.path.exists(pytest_bin_check):
-            import shutil
             shutil.rmtree(venv_dir, ignore_errors=True)
 
         if not os.path.exists(venv_dir):
-            out, code = self._run(
-                ["uv", "venv", "--python", sys.executable, venv_dir],
-                cwd="/tmp",
-                extra_env=uv_env,
-            )
+            if uv_bin:
+                out, code = self._run(
+                    [uv_bin, "venv", "--python", sys.executable, venv_dir],
+                    cwd="/tmp",
+                    extra_env=uv_env,
+                )
+            else:
+                out, code = ("uv executable not found", 127)
             if code != 0:
                 ui_msg = (
                     f"uv venv failed (exit {code}) — falling back to "
@@ -290,6 +341,11 @@ class PythonRuntime(LanguageRuntime):
                     cwd="/tmp",
                     raise_on_error=True,
                 )
+                self._run(
+                    [os.path.join(venv_dir, "bin", "python"), "-m", "ensurepip", "--upgrade"],
+                    cwd="/tmp",
+                    raise_on_error=False,
+                )
 
         # FIX-010: Resolve the venv's python interpreter to use as the pip fallback.
         # Using `python -m pip` via the venv's python binary avoids the "No such file or
@@ -299,10 +355,13 @@ class PythonRuntime(LanguageRuntime):
 
         def _install_deps(args: list[str]) -> bool:
             """Try uv pip install first; fall back to the venv python -m pip on failure."""
-            out, code = self._run(
-                ["uv", "pip", "install", "--python", venv_dir, "--quiet"] + args,
-                cwd=repo_dir, timeout=600, extra_env=uv_env,
-            )
+            if uv_bin:
+                out, code = self._run(
+                    [uv_bin, "pip", "install", "--python", venv_dir, "--quiet"] + args,
+                    cwd=repo_dir, timeout=600, extra_env=uv_env,
+                )
+            else:
+                out, code = ("uv executable not found", 127)
             if code != 0:
                 import warnings
                 warnings.warn(f"uv pip install failed (exit {code}) — falling back to pip. {out.strip()[:200]}")

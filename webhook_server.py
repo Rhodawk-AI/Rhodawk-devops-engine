@@ -59,6 +59,12 @@ def get_webhook_log(limit: int = 50) -> list[dict]:
         return list(reversed(_webhook_log[-limit:]))
 
 
+def clear_webhook_log() -> None:
+    with _webhook_lock:
+        _webhook_log.clear()
+        _rate_limit.clear()
+
+
 def _verify_github_signature(body: bytes, signature_header: str) -> bool:
     if not WEBHOOK_SECRET:
         # BUG-006 FIX: Emit a loud warning instead of silently passing all requests.

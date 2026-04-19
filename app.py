@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import signal
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -76,7 +77,7 @@ from verification_loop import (
 )
 from webhook_server import set_job_dispatcher, start_webhook_server
 from worker_pool import MAX_WORKERS, run_parallel_audit
-from language_runtime import RuntimeFactory, LanguageRuntime, EnvConfig
+from language_runtime import RuntimeFactory, LanguageRuntime, EnvConfig, kill_runtime_processes
 
 # Module-level runtime handle — set once per audit run.
 # BUG-007 FIX: Protected by a lock so concurrent webhook-triggered audits do not
@@ -93,6 +94,11 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 TENANT_ID = os.getenv("RHODAWK_TENANT_ID", "default")
 MODEL = os.getenv("RHODAWK_MODEL", "openrouter/qwen/qwen-2.5-coder-32b-instruct:free")
 RED_TEAM_ENABLED = os.getenv("RHODAWK_RED_TEAM_ENABLED", "true").lower() != "false"
+PAID_API_KEY_WARNING = (
+    "Please use a PAID API KEY without rate limits. Free-tier API keys usually hit "
+    "8 to 9 requests per minute, but this system needs 25+ requests per minute and "
+    "high context windows."
+)
 
 # Only GITHUB_TOKEN and OPENROUTER_API_KEY are truly required at startup.
 # GITHUB_REPO is now optional — it can be supplied via the chat inbox at runtime.
@@ -129,6 +135,8 @@ initialize_store()
 dashboard_logs: list[str] = []
 _log_lock = threading.Lock()
 _audit_event = threading.Event()
+_active_process_groups: set[int] = set()
+_process_lock = threading.Lock()
 
 # Chat inbox state — list of {"role": ..., "content": ...} dicts
 _inbox_history: list[dict] = []
@@ -162,14 +170,25 @@ def run_subprocess_safe(cmd: list, cwd: str = REPO_DIR, timeout: int = 300,
     if env_overrides:
         env.update(env_overrides)
     proc = None
+    pgid = None
     try:
         proc = subprocess.Popen(cmd, shell=False, cwd=cwd, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, env=env, start_new_session=True)
+        try:
+            pgid = os.getpgid(proc.pid)
+            with _process_lock:
+                _active_process_groups.add(pgid)
+        except ProcessLookupError:
+            pgid = None
         stdout, stderr = proc.communicate(timeout=timeout)
         output = (stdout or "") + "\n" + (stderr or "")
         if raise_on_error and proc.returncode != 0:
             raise subprocess.CalledProcessError(proc.returncode, cmd, stdout, stderr)
         return output, proc.returncode
+    except FileNotFoundError as e:
+        if raise_on_error:
+            raise
+        return str(e), 127
     except subprocess.TimeoutExpired:
         if proc:
             try:
@@ -178,6 +197,30 @@ def run_subprocess_safe(cmd: list, cwd: str = REPO_DIR, timeout: int = 300,
                 pass
             proc.communicate()
         raise RuntimeError(f"Command timed out after {timeout}s: {cmd[0]}")
+    finally:
+        if pgid is not None:
+            with _process_lock:
+                _active_process_groups.discard(pgid)
+
+
+def _kill_active_processes() -> int:
+    with _process_lock:
+        groups = list(_active_process_groups)
+        _active_process_groups.clear()
+    killed = kill_runtime_processes()
+    for pgid in groups:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+            killed += 1
+        except ProcessLookupError:
+            continue
+    time.sleep(0.2)
+    for pgid in groups:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            continue
+    return killed
 
 
 # ──────────────────────────────────────────────────────────────
@@ -596,6 +639,12 @@ def process_failing_test(
 
     max_total_attempts = MAX_RETRIES + max(0, ADVERSARIAL_REJECTION_MULTIPLIER)
     for attempt_num in range(1, max_total_attempts + 1):
+        if not _audit_event.is_set():
+            return VerificationResult(
+                success=False,
+                attempts=attempt_history,
+                failure_reason="Audit terminated by operator",
+            )
         ui_log(f"Attempt {attempt_num}/{max_total_attempts}: {test_path}", "RETRY" if attempt_num > 1 else "INFO")
 
         # ── Step 1: Retrieve similar fixes ──────────────────────
@@ -789,6 +838,9 @@ def process_audit_test(
     tenant_id: str,
     target_repo: str,
 ) -> dict:
+    if not _audit_event.is_set():
+        return {"skipped": True, "error": "Audit terminated by operator"}
+
     filename = os.path.basename(test_path)
     branch_name = f"rhodawk/auto-patch/{filename.replace('.py','').replace('_','-')}"
 
@@ -927,6 +979,7 @@ def enterprise_audit_loop(repo_override: str = None, branch: str = "main", speci
 
     ui_log("═" * 70)
     ui_log(f"AUDIT START — Tenant: {TENANT_ID} | Repo: {target_repo} | Dir: {REPO_DIR} | Model: {MODEL}")
+    ui_log(PAID_API_KEY_WARNING, "WARN")
     notify_audit_start(target_repo)
     log_audit_event("AUDIT_START", "orchestrator", target_repo, MODEL,
                     {"tenant": TENANT_ID, "branch": branch, "repo_dir": REPO_DIR}, "STARTED")
@@ -968,6 +1021,9 @@ def enterprise_audit_loop(repo_override: str = None, branch: str = "main", speci
         ui_log(f"Detected language: {_active_runtime.language.upper()}", "INFO")
 
         env_config = _active_runtime.setup_env(REPO_DIR, PERSISTENT_DIR)
+        if not _audit_event.is_set():
+            ui_log("Audit terminated during environment setup.", "WARN")
+            return
 
         # ── Test discovery ────────────────────────────────────────────
         if specific_test:
@@ -985,7 +1041,11 @@ def enterprise_audit_loop(repo_override: str = None, branch: str = "main", speci
             relative_tests, process_audit_test,
             env_config=env_config, mcp_config_path=mcp_config_path,
             tenant_id=TENANT_ID, target_repo=target_repo,
+            should_stop=lambda: not _audit_event.is_set(),
         )
+        if not _audit_event.is_set():
+            ui_log("Audit terminated before worker pool completed.", "WARN")
+            return
         ui_log(
             f"Worker pool complete — workers={MAX_WORKERS}, healed={pool_result['healed']}, "
             f"already_green={pool_result['already_green']}, "
@@ -1103,8 +1163,9 @@ def terminate_audit() -> str:
     if not _audit_event.is_set():
         return "ℹ️ No audit is currently running."
     _audit_event.clear()
-    ui_log("⛔ Audit terminated by operator.", "WARN")
-    return "⛔ Audit stopped. You can now submit a new repository."
+    killed = _kill_active_processes()
+    ui_log(f"⛔ Audit terminated by operator. Stopped {killed} active subprocess group(s).", "WARN")
+    return f"⛔ Audit stopped. Terminated {killed} active subprocess group(s). You can now submit a new repository."
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1148,6 +1209,7 @@ def submit_repo_audit(repo_input: str, chat_history: list) -> tuple[list, str]:
         ], ""
 
     _audit_event.set()
+    ui_log(PAID_API_KEY_WARNING, "WARN")
     threading.Thread(
         target=enterprise_audit_loop,
         kwargs={"repo_override": repo},
@@ -1162,6 +1224,7 @@ def submit_repo_audit(repo_input: str, chat_history: list) -> tuple[list, str]:
                 f"🚀 **Audit started for `{repo}`**\n\n"
                 f"Watch the **Live Agent Log** below for real-time progress.\n"
                 f"I'll post results here when the audit completes.\n\n"
+                f"⚠️ **{PAID_API_KEY_WARNING}**\n\n"
                 f"_Model: `{MODEL}` · Tenant: `{TENANT_ID}`_"
             ),
         },
@@ -1176,15 +1239,25 @@ def get_inbox_history() -> list:
     return msgs or []
 
 
-def trigger_audit_fn():
-    """Legacy button handler — uses GITHUB_REPO env var if set."""
-    if not GITHUB_REPO:
-        return "⚠️ No GITHUB_REPO env var set. Use the chat inbox above to enter a repo."
+def trigger_audit_fn(repo_input: str = ""):
+    """Legacy button handler — uses typed repo first, then GITHUB_REPO env var."""
+    raw = (repo_input or "").strip()
+    repo = _normalize_repo(raw) if raw else ""
+    target_repo = repo or _normalize_repo(GITHUB_REPO) or GITHUB_REPO
+    if raw and not repo:
+        return "⚠️ Could not parse that repo. Use owner/repo or a GitHub URL."
+    if not target_repo:
+        return "⚠️ Enter a repo above or set GITHUB_REPO."
     if _audit_event.is_set():
         return "⚠️ Audit already running."
     _audit_event.set()
-    threading.Thread(target=enterprise_audit_loop, daemon=True).start()
-    return f"🚀 Audit triggered for `{GITHUB_REPO}` — full healing loop deployed."
+    ui_log(PAID_API_KEY_WARNING, "WARN")
+    threading.Thread(
+        target=enterprise_audit_loop,
+        kwargs={"repo_override": target_repo},
+        daemon=True,
+    ).start()
+    return f"⚠️ {PAID_API_KEY_WARNING}\n\n🚀 Audit triggered for `{target_repo}` — full healing loop deployed."
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1193,6 +1266,7 @@ def trigger_audit_fn():
 def _webhook_dispatch(**kwargs):
     if not _audit_event.is_set():
         _audit_event.set()
+        ui_log(PAID_API_KEY_WARNING, "WARN")
         threading.Thread(target=enterprise_audit_loop, kwargs=kwargs, daemon=True).start()
 
 set_job_dispatcher(_webhook_dispatch)
@@ -1366,12 +1440,29 @@ def export_compliance_display() -> str:
 
 
 def reset_queue():
-    import shutil
+    from webhook_server import clear_webhook_log
     shutil.rmtree("/data/jobs", ignore_errors=True)
+    for path in [
+        "/data/audit_trail.jsonl",
+        "/data/rhodawk_soc2_audit_summary.md",
+        "/data/swebench_report.md",
+    ]:
+        try:
+            if os.path.exists(path):
+                os.unlink(path)
+        except OSError:
+            pass
+    shutil.rmtree("/data/lora_exports", ignore_errors=True)
+    clear_webhook_log()
+    with _log_lock:
+        dashboard_logs.clear()
+    with _inbox_lock:
+        _inbox_history.clear()
     # Also unblock the audit event so a new repo can be submitted immediately
     _audit_event.clear()
-    ui_log("🗑 Queue cleared and audit lock released by operator.", "WARN")
-    return "✅ Queue cleared and audit stopped. You can now submit a new repository."
+    _kill_active_processes()
+    ui_log("🗑 Queue, live logs, audit trail, webhook logs, reports, and audit lock cleared by operator.", "WARN")
+    return "✅ Queue reset complete. Live logs, audit trail, webhook logs, reports, and running audit state were cleared."
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1818,12 +1909,12 @@ with gr.Blocks(title="Rhodawk AI — Code Review Monster", theme=THEME) as demo:
 
             # ── CONTROLS ROW ──────────────────────────────────────
             with gr.Row():
-                btn_audit     = gr.Button("🚀 Trigger Audit (env GITHUB_REPO)", variant="secondary", scale=3)
+                btn_audit     = gr.Button("🚀 Trigger Audit (repo above or env fallback)", variant="secondary", scale=3)
                 btn_terminate = gr.Button("⛔ Terminate Audit", variant="stop", scale=2)
                 btn_reset     = gr.Button("🗑 Reset Queue", variant="secondary", scale=1)
 
             trigger_out = gr.Textbox(label="", interactive=False, show_label=False)
-            btn_audit.click(trigger_audit_fn,  outputs=trigger_out)
+            btn_audit.click(trigger_audit_fn, inputs=repo_textbox, outputs=trigger_out)
             btn_terminate.click(terminate_audit, outputs=trigger_out)
             btn_reset.click(reset_queue,        outputs=trigger_out)
 

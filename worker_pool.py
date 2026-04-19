@@ -117,6 +117,7 @@ def run_parallel_audit(
     mcp_config_path: str,
     tenant_id: str,
     target_repo: str,
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict:
     results = {"healed": 0, "failed": 0, "skipped": 0, "already_green": 0, "prs": [], "errors": []}
 
@@ -124,40 +125,70 @@ def run_parallel_audit(
         return results
 
     runner = _run_isolated if PROCESS_ISOLATE else _process_one_test
+    should_stop = should_stop or (lambda: False)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(
+        pending_tests = iter(test_files)
+        futures = {}
+
+        def submit_next() -> bool:
+            if should_stop():
+                return False
+            try:
+                test_path = next(pending_tests)
+            except StopIteration:
+                return False
+            future = executor.submit(
                 runner,
-                test_path=t,
+                test_path=test_path,
                 process_fn=process_fn,
                 env_config=env_config,
                 mcp_config_path=mcp_config_path,
                 tenant_id=tenant_id,
                 repo=target_repo,
-            ): t
-            for t in test_files
-        }
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                outcome = future.result()
-            except Exception as e:
-                outcome = {"success": False, "error": str(e)}
+            )
+            futures[future] = test_path
+            return True
 
-            if outcome.get("skipped"):
-                results["skipped"] += 1
-            elif outcome.get("already_green"):
-                results["already_green"] += 1
-                if outcome.get("pr_url"):
-                    results["prs"].append(outcome.get("pr_url"))
-            elif outcome.get("success"):
-                results["healed"] += 1
-                if outcome.get("pr_url"):
-                    results["prs"].append(outcome.get("pr_url"))
-            else:
-                results["failed"] += 1
-                if outcome.get("error"):
-                    results["errors"].append(outcome["error"])
+        for _ in range(min(MAX_WORKERS, len(test_files))):
+            submit_next()
+
+        while futures:
+            done, _ = concurrent.futures.wait(
+                futures,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            for future in done:
+                futures.pop(future, None)
+                if should_stop():
+                    results["skipped"] += len(futures)
+                    for pending in futures:
+                        pending.cancel()
+                    futures.clear()
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    return results
+
+                try:
+                    outcome = future.result()
+                except Exception as e:
+                    outcome = {"success": False, "error": str(e)}
+
+                if outcome.get("skipped"):
+                    results["skipped"] += 1
+                elif outcome.get("already_green"):
+                    results["already_green"] += 1
+                    if outcome.get("pr_url"):
+                        results["prs"].append(outcome.get("pr_url"))
+                elif outcome.get("success"):
+                    results["healed"] += 1
+                    if outcome.get("pr_url"):
+                        results["prs"].append(outcome.get("pr_url"))
+                else:
+                    results["failed"] += 1
+                    if outcome.get("error"):
+                        results["errors"].append(outcome["error"])
+
+                submit_next()
 
     return results
 
