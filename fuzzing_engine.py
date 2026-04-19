@@ -152,21 +152,47 @@ def _extract_code_block(text: str) -> str:
 def _fallback_harness(target: str, language: str) -> str:
     """Generic fallback harness when LLM is unavailable."""
     if language == "python":
+        # FIX (Build Error): atheris requires Clang + libFuzzer at compile time and
+        # fails to build on HuggingFace Spaces.  The fallback harness now uses
+        # hypothesis which is available everywhere, matching the Hypothesis
+        # fallback already in use when atheris is unavailable at runtime.
         return f"""
-import atheris
 import sys
+try:
+    import atheris
+    _ATHERIS_AVAILABLE = True
+except ImportError:
+    _ATHERIS_AVAILABLE = False
 
-@atheris.instrument_func
-def fuzz_target(data):
-    fdp = atheris.FuzzedDataProvider(data)
-    try:
-        val = fdp.ConsumeUnicodeNoSurrogates(128)
-        # TODO: call {target}(val)
-    except Exception:
-        pass
+if _ATHERIS_AVAILABLE:
+    import sys
 
-atheris.Setup(sys.argv, fuzz_target)
-atheris.Fuzz()
+    @atheris.instrument_func
+    def fuzz_target(data):
+        fdp = atheris.FuzzedDataProvider(data)
+        try:
+            val = fdp.ConsumeUnicodeNoSurrogates(128)
+            # TODO: call {target}(val)
+        except Exception:
+            pass
+
+    atheris.Setup(sys.argv, fuzz_target)
+    atheris.Fuzz()
+else:
+    # Hypothesis-based fallback when atheris/libFuzzer is unavailable
+    from hypothesis import given, settings, HealthCheck
+    from hypothesis import strategies as st
+
+    @given(st.text(max_size=128))
+    @settings(max_examples=500, suppress_health_check=list(HealthCheck))
+    def fuzz_target(val):
+        try:
+            # TODO: call {target}(val)
+            pass
+        except Exception:
+            pass
+
+    fuzz_target()
 """
     return f"# Fallback harness for {target} ({language})\n# Manual harness required\n"
 
@@ -331,7 +357,20 @@ def run_fuzzing_campaign(
 
     start = time.time()
     if language == "python" and "atheris" in harness_code:
-        crashes = _run_python_atheris(harness_code, duration_s)
+        # FIX (Build Error): atheris may be unavailable; fall back to Hypothesis.
+        try:
+            import importlib.util
+            _atheris_available = importlib.util.find_spec("atheris") is not None
+        except Exception:
+            _atheris_available = False
+        if _atheris_available:
+            crashes = _run_python_atheris(harness_code, duration_s)
+        else:
+            # Rewrite the harness to use Hypothesis if atheris is not installed
+            harness_code = harness_code.replace(
+                "import atheris", "# atheris unavailable — using Hypothesis fallback"
+            )
+            crashes = _run_hypothesis(repo_dir, target, harness_code, duration_s)
     else:
         crashes = _run_hypothesis(repo_dir, target, harness_code, duration_s)
 

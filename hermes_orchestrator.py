@@ -210,10 +210,30 @@ class SSECTool(HermesTool):
         return run_ssec_scan(repo_dir, focus_files=focus_files)
 
 
+class ChainAnalyzerTool(HermesTool):
+    name = "chain_analysis"
+    description = (
+        "Synthesize stored primitive findings into higher-severity exploit chains. "
+        "Call after at least 2 primitives are recorded. Returns THEORETICAL proposals "
+        "tagged PENDING_HUMAN_REVIEW — no chain is executed automatically."
+    )
+
+    def run(self, repo_dir: str, repo: str = "", **kwargs) -> dict:
+        hermes_log(f"Chain analysis → {repo or repo_dir}", "EXPLOIT")
+        from chain_analyzer import analyze_chains, get_all_primitives
+        target = repo or repo_dir
+        primitives = get_all_primitives(repo=target)
+        if len(primitives) < 2:
+            return {"chains": [], "note": f"Only {len(primitives)} primitive(s) stored — need ≥2 to chain"}
+        chains = analyze_chains(repo=target)
+        return {"chains": chains, "primitive_count": len(primitives)}
+
+
 _TOOL_REGISTRY: dict[str, HermesTool] = {
     t.name: t() for t in [
         ReconTool, TaintTool, SymbolicTool, FuzzTool,
         ExploitTool, CVETool, CommitWatchTool, SSECTool,
+        ChainAnalyzerTool,
     ]
 }
 
@@ -326,6 +346,7 @@ You have access to these tools:
 - cve_intel: Query historical CVEs for similar patterns
 - commit_watch: Find silent security patches in commit history
 - ssec_scan: Semantic similarity to known exploit patterns
+- chain_analysis: Synthesize stored primitive findings into exploit chains (call after ≥2 findings)
 
 For each target, produce a research plan and execute it step by step.
 When you find something, rate its severity honestly. Never hallucinate findings.
@@ -352,7 +373,14 @@ Or to signal completion:
 """
 
 
+_RATE_LIMIT_BACKOFF_DELAYS = [15, 30, 60]  # seconds — exponential backoff for 429s
+
+
 def _hermes_llm_call(messages: list[dict], model: str = None, timeout: int = 120) -> dict:
+    """
+    Call the Hermes LLM with exponential backoff on rate-limit (429) responses.
+    Three retries before giving up — prevents a single 429 from aborting a session.
+    """
     if not OPENROUTER_API_KEY:
         return {"done": True, "summary": "OPENROUTER_API_KEY not set"}
 
@@ -370,17 +398,34 @@ def _hermes_llm_call(messages: list[dict], model: str = None, timeout: int = 120
         "max_tokens": 2048,
         "response_format": {"type": "json_object"},
     }
-    try:
-        resp = requests.post(
-            f"{OPENROUTER_BASE}/chat/completions",
-            headers=headers, json=payload, timeout=timeout,
-        )
-        resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
-        return json.loads(content)
-    except Exception as e:
-        hermes_log(f"LLM call failed: {e}", "WARN")
-        return {"done": True, "summary": f"LLM error: {e}"}
+
+    last_error: Exception | None = None
+    for attempt, backoff in enumerate([0] + _RATE_LIMIT_BACKOFF_DELAYS):
+        if backoff:
+            hermes_log(f"Rate limit hit — waiting {backoff}s before retry {attempt}/{len(_RATE_LIMIT_BACKOFF_DELAYS)}", "WARN")
+            time.sleep(backoff)
+        try:
+            resp = requests.post(
+                f"{OPENROUTER_BASE}/chat/completions",
+                headers=headers, json=payload, timeout=timeout,
+            )
+            if resp.status_code == 429:
+                last_error = Exception(f"HTTP 429 rate limit (attempt {attempt + 1})")
+                hermes_log(str(last_error), "WARN")
+                continue
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
+            return json.loads(content)
+        except Exception as e:
+            if "429" in str(e):
+                last_error = e
+                hermes_log(f"Rate limit exception: {e}", "WARN")
+                continue
+            hermes_log(f"LLM call failed: {e}", "WARN")
+            return {"done": True, "summary": f"LLM error: {e}"}
+
+    hermes_log(f"LLM call exhausted all retries. Last error: {last_error}", "WARN")
+    return {"done": True, "summary": f"LLM rate limit — all retries exhausted: {last_error}"}
 
 
 # ──────────────────────────────────────────────────────────────
@@ -528,8 +573,17 @@ def run_hermes_research(
 
 
 def _run_acts_consensus(session: HermesSession):
-    """Run multi-model adversarial consensus on each finding to compute ACTS score."""
-    from adversarial_reviewer import _call_concurrent_consensus
+    """
+    Run multi-model adversarial consensus on each finding to compute ACTS score.
+
+    FIX (ACTS Bug): Previously _call_concurrent_consensus returned a single merged
+    result, so compute_acts() always received a 1-item list with agreement_factor=1.0
+    — completely bypassing the disagreement penalty.  Now we call each consensus model
+    individually so all 3 raw verdicts are passed to compute_acts(), enabling the full
+    Bayesian disagreement weighting to work as designed.
+    """
+    import concurrent.futures
+    from adversarial_reviewer import _call_single_model, ADVERSARY_SYSTEM_PROMPT
 
     CONSENSUS_MODELS = [
         "deepseek/deepseek-r1:free",
@@ -551,12 +605,40 @@ def _run_acts_consensus(session: HermesSession):
             "Is this a real, exploitable vulnerability? Respond as a hostile security reviewer."
         )
         try:
-            result, _ = _call_concurrent_consensus(prompt)
+            # Call all 3 models concurrently and collect individual raw verdicts.
+            # This is required so compute_acts() receives the full disagreement signal
+            # rather than a pre-merged single verdict (which collapses agreement_factor to 1.0).
+            individual_results: list[dict] = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(CONSENSUS_MODELS)) as ex:
+                futures = {
+                    ex.submit(_call_single_model, model, prompt): model
+                    for model in CONSENSUS_MODELS
+                }
+                for future in concurrent.futures.as_completed(futures, timeout=90):
+                    try:
+                        result_dict, _ = future.result()
+                        if result_dict is not None:
+                            individual_results.append(result_dict)
+                    except Exception:
+                        pass
+
+            if not individual_results:
+                raise RuntimeError("All ACTS consensus models failed")
+
+            # Build one verdict entry per model response so compute_acts sees N items.
             verdicts = [
-                {"verdict": result.get("verdict", "UNCERTAIN"), "confidence": result.get("confidence", 0.5)}
+                {
+                    "verdict": r.get("verdict", "UNCERTAIN"),
+                    "confidence": float(r.get("confidence", 0.5)),
+                }
+                for r in individual_results
             ]
             finding.acts_score = compute_acts(verdicts)
-            hermes_log(f"ACTS score for {finding.finding_id}: {finding.acts_score}", "ACTS")
+            hermes_log(
+                f"ACTS score for {finding.finding_id}: {finding.acts_score} "
+                f"({len(verdicts)} model verdicts: {[v['verdict'] for v in verdicts]})",
+                "ACTS",
+            )
         except Exception as e:
             hermes_log(f"ACTS consensus failed for {finding.finding_id}: {e}", "WARN")
             finding.acts_score = finding.confidence
