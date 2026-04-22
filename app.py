@@ -603,8 +603,13 @@ def run_aider(mcp_config_path: str, prompt: str, context_files: list[str]) -> tu
         valid = [f for f in context_files if os.path.exists(os.path.join(REPO_DIR, f))]
         cmd = ["aider", "--model", MODEL, "--yes", "--no-stream",
                "--message-file", prompt_path]
-        if mcp_config_path and os.path.exists(mcp_config_path):
-            cmd += ["--mcp-config", mcp_config_path]
+        # NOTE: --mcp-config is NOT a supported aider CLI flag in any released
+        # version of aider-chat (including 0.86.1). Native MCP support was
+        # requested upstream (issue #3314) but never merged. Passing this flag
+        # caused aider to print usage text and exit non-zero on every single
+        # call, producing 0% fix rate. The mcp_config_path argument is kept in
+        # the function signature for forward-compatibility but is intentionally
+        # not forwarded to the aider subprocess until upstream adds the flag.
         cmd += valid
         return run_subprocess_safe(cmd, cwd=REPO_DIR, timeout=600,
                                    env_overrides={"OPENROUTER_API_KEY": OPENROUTER_API_KEY},
@@ -697,7 +702,9 @@ def process_failing_test(
 
         if aider_code != 0:
             ui_log(f"Aider non-zero exit on attempt {attempt_num}", "WARN")
-            ui_log(f"AIDER CRASH REASON: {aider_output.strip()[:800]}", "FAIL")
+            # Show full output (not truncated) so argparse "error: unrecognized
+            # arguments" lines at the tail are not cut off.
+            ui_log(f"AIDER CRASH REASON: {aider_output.strip()}", "FAIL")
             attempt_history.append(VerificationAttempt(
                 attempt_number=attempt_num, prompt_hash=prompt_hash,
                 aider_exit_code=aider_code, test_exit_code=-1,
