@@ -20,12 +20,22 @@ COPY requirements.txt .
 # that require special compile-time tooling (e.g. atheris/libFuzzer).
 # atheris has been removed from requirements.txt; Hypothesis is the fallback.
 RUN pip install --no-cache-dir -r requirements.txt mcp-server-fetch && \
-    # Aider 0.86.2 hard-pins litellm==1.75.0 which has a broken module
-    # surface (missing APIConnectionError, _logging, encode, token_counter
-    # at module level). Force-upgrade to a patched litellm after aider
-    # is installed — pip's --no-deps lets us override aider's pin, and
-    # aider only uses litellm via getattr so a newer release works fine.
-    pip install --no-cache-dir --upgrade --no-deps "litellm==1.78.5"
+    # Aider's strict pins (pillow==12.1.1, litellm==1.75.0) conflict with
+    # gradio (pillow<12) and ship a broken litellm module surface
+    # (missing APIConnectionError, _logging, encode, token_counter).
+    # We install aider WITHOUT its deps and then provide a known-good
+    # set of its actual runtime imports — letting gradio's pillow 11
+    # win, and a patched litellm replace the broken 1.75.0.
+    pip install --no-cache-dir --no-deps "aider-chat==0.86.2" && \
+    pip install --no-cache-dir --upgrade --no-deps "litellm==1.78.5" && \
+    pip install --no-cache-dir \
+        "configargparse" "jsonschema" "rich" "prompt_toolkit" "pyyaml" \
+        "packaging" "pathspec" "diskcache" "networkx" "scipy" \
+        "beautifulsoup4" "pypandoc" "flake8" "importlib_resources" \
+        "pyperclip" "pexpect" "json5" "psutil" "watchfiles" "socksio" \
+        "mixpanel" "posthog" "tree-sitter" "grep_ast" "oslex" \
+        "tokenizers" "google-generativeai" "openai" "diff-match-patch" \
+        "soundfile" "sounddevice"
 
 
 # Stage 2: Runtime — inherits installed packages from base
