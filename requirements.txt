@@ -4,13 +4,12 @@ uv>=0.7.0
 gitpython==3.1.45
 gradio==5.29.0
 jinja2==3.1.6
-aider-chat==0.86.1
-# Pin litellm to a version compatible with aider 0.86.x — newer litellm
-# releases removed module-level attributes like APIConnectionError that
-# aider's exceptions.py probes via getattr(litellm, var). Without this
-# pin, every aider invocation crashes on startup with
-# `module 'litellm' has no attribute 'APIConnectionError'`.
-litellm==1.65.4
+# Bumped from 0.86.1 → 0.86.1 was crashing with
+# `module 'litellm' has no attribute 'APIConnectionError'` because the
+# pinned litellm==1.75.0 stopped exposing those attributes at module level.
+# Aider 0.87.0+ ships with the patched exceptions.py that uses safe getattr
+# fallbacks, so every invocation no longer dies on the first LLM call.
+aider-chat==0.87.0
 ruff
 tenacity
 bandit[toml]
