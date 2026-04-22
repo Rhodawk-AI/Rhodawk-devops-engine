@@ -19,7 +19,13 @@ COPY requirements.txt .
 # Install dependencies directly — avoids wheel-build failures for packages
 # that require special compile-time tooling (e.g. atheris/libFuzzer).
 # atheris has been removed from requirements.txt; Hypothesis is the fallback.
-RUN pip install --no-cache-dir -r requirements.txt mcp-server-fetch
+RUN pip install --no-cache-dir -r requirements.txt mcp-server-fetch && \
+    # Aider 0.86.2 hard-pins litellm==1.75.0 which has a broken module
+    # surface (missing APIConnectionError, _logging, encode, token_counter
+    # at module level). Force-upgrade to a patched litellm after aider
+    # is installed — pip's --no-deps lets us override aider's pin, and
+    # aider only uses litellm via getattr so a newer release works fine.
+    pip install --no-cache-dir --upgrade --no-deps "litellm==1.78.5"
 
 
 # Stage 2: Runtime — inherits installed packages from base
