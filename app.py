@@ -79,6 +79,30 @@ from webhook_server import set_job_dispatcher, start_webhook_server
 from worker_pool import MAX_WORKERS, run_parallel_audit
 from language_runtime import RuntimeFactory, LanguageRuntime, EnvConfig, kill_runtime_processes
 
+# ── Mythos-level upgrade integration ────────────────────────────────────────
+# Imports below are all wrapped: a missing optional native dep (Joern, KLEE,
+# pwntools, …) MUST never break Rhodawk boot. The package itself is pure
+# Python; every heavy bridge has an `available()` guard.
+try:
+    from mythos import MYTHOS_VERSION, build_default_orchestrator
+    from mythos.integration import mythos_enabled, maybe_run_mythos
+    from mythos.diagnostics import availability_matrix as mythos_availability_matrix
+    _MYTHOS_OK = True
+    _MYTHOS_IMPORT_ERR = ""
+except Exception as _e:  # noqa: BLE001
+    MYTHOS_VERSION = "unavailable"
+    _MYTHOS_OK = False
+    _MYTHOS_IMPORT_ERR = f"{type(_e).__name__}: {_e}"
+
+    def mythos_enabled() -> bool:
+        return False
+
+    def maybe_run_mythos(target):
+        return None
+
+    def mythos_availability_matrix():
+        return {"_error": _MYTHOS_IMPORT_ERR}
+
 # Module-level runtime handle — set once per audit run.
 # BUG-007 FIX: Protected by a lock so concurrent webhook-triggered audits do not
 # overwrite _active_runtime while workers are mid-flight reading it.
@@ -1688,6 +1712,28 @@ def _hermes_run_background(
         _hermes_sessions[session.session_id] = session
         _hermes_active_session_id = session.session_id
 
+        # ── Mythos refinement pass ────────────────────────────────────────
+        # When RHODAWK_MYTHOS=1 the multi-agent Planner/Explorer/Executor
+        # loop runs *after* Hermes and folds extra findings + a probabilistic
+        # attack-graph into the same disclosure pipeline. Failures here are
+        # logged but never break Hermes' own findings.
+        try:
+            mythos_dossier = maybe_run_mythos({
+                "repo": target_repo,
+                "repo_path": repo_dir,
+                "focus": focus_area,
+                "languages": [],
+                "frameworks": [],
+                "dependencies": [],
+                "harness_dir": f"/tmp/mythos/{target_repo.replace('/', '_')}",
+            })
+            if mythos_dossier:
+                ui_log(f"Mythos returned {len(mythos_dossier.get('iterations', []))} "
+                       f"iteration(s)", "MYTHOS")
+                session.mythos_dossier = mythos_dossier  # type: ignore[attr-defined]
+        except Exception as _me:  # noqa: BLE001
+            ui_log(f"Mythos refinement failed (non-fatal): {_me}", "MYTHOS")
+
         for finding in session.findings:
             add_to_pipeline(
                 finding_id=finding.finding_id,
@@ -2037,6 +2083,32 @@ GET  /webhook/queue     — Current job status (JSON)
             )
             lora_export_btn.click(_force_lora_export, outputs=lora_result_box)
 
+        # ── TAB 9b: MYTHOS UPGRADE ────────────────────────────
+        # Wires the multi-agent / probabilistic / RL upgrade plane into the
+        # operator dashboard. See `mythos/MYTHOS_PLAN.md` and
+        # `ARCHITECTURE_ANALYSIS.md` for the full design.
+        with gr.Tab("🜲 Mythos"):
+            gr.Markdown(
+                f"### Mythos-Level Upgrade — v{MYTHOS_VERSION}\n"
+                "Multi-agent (Planner / Explorer / Executor) + probabilistic "
+                "reasoning + RL self-improvement + 6 new MCP servers + FastAPI "
+                "productization API. **Opt in** with `RHODAWK_MYTHOS=1`. The "
+                "productization API auto-boots in a thread when `MYTHOS_API=1`."
+            )
+            mythos_status_box = gr.TextArea(
+                label="Mythos Status & Capability Matrix", lines=22, interactive=False)
+            mythos_run_box = gr.TextArea(
+                label="Last Sample Campaign Output (JSON)", lines=18, interactive=False)
+            with gr.Row():
+                mythos_refresh_btn = gr.Button("🔄 Refresh Status", variant="secondary")
+                mythos_smoke_btn   = gr.Button("🚀 Run Sample Campaign", variant="primary")
+
+            mythos_refresh_btn.click(lambda: get_mythos_status_display(),
+                                     outputs=mythos_status_box)
+            mythos_smoke_btn.click(lambda: run_mythos_sample_campaign(),
+                                   outputs=mythos_run_box)
+            demo_mythos_load = mythos_status_box
+
         # ── TAB 10: ARCHITECTURE ──────────────────────────────
         with gr.Tab("ℹ️ Architecture"):
             compliance_out = gr.Textbox(label="Compliance Export", interactive=False)
@@ -2376,8 +2448,89 @@ After approval, you can submit to HackerOne or create a GitHub Security Advisory
     demo.load(get_swebench_display,     outputs=swebench_report)
 
 
+# ─── Mythos status + sample campaign helpers (used by the Mythos tab) ────────
+def get_mythos_status_display() -> str:
+    """Render the Mythos availability matrix + env config as plain text."""
+    import json as _json
+    if not _MYTHOS_OK:
+        return f"❌ Mythos package failed to import: {_MYTHOS_IMPORT_ERR}"
+    try:
+        matrix = mythos_availability_matrix()
+    except Exception as e:  # noqa: BLE001
+        return f"❌ Mythos status error: {e}"
+    enabled = "ON" if mythos_enabled() else "OFF (set RHODAWK_MYTHOS=1)"
+    api_on  = "ON" if os.getenv("MYTHOS_API", "0").lower() in ("1","true","yes","on") else "OFF"
+    lines = [
+        f"Mythos version       : {MYTHOS_VERSION}",
+        f"Multi-agent loop     : {enabled}",
+        f"Productization API   : {api_on}  (uvicorn mythos.api.fastapi_server:app)",
+        f"Tier-1 primary model : {os.getenv('MYTHOS_TIER1_PRIMARY', 'deepseek/deepseek-v2-chat')}",
+        f"Tier-2 primary model : {os.getenv('MYTHOS_TIER2_PRIMARY', 'qwen/qwen-2.5-coder-72b-instruct')}",
+        "",
+        "Capability matrix (✓ = available, ✗ = optional native dep missing):",
+    ]
+    for k, v in sorted(matrix.items()):
+        ok = v.get("available") if isinstance(v, dict) else False
+        err = (" — " + v.get("error")) if isinstance(v, dict) and v.get("error") else ""
+        lines.append(f"  {'✓' if ok else '✗'} {k:28s}{err}")
+    lines.append("")
+    lines.append("Reference: mythos/MYTHOS_PLAN.md   |   ARCHITECTURE_ANALYSIS.md")
+    return "\n".join(lines)
+
+
+def run_mythos_sample_campaign() -> str:
+    """Kick off a 1-iteration sample campaign against /data/repo (or cwd)."""
+    import json as _json
+    if not _MYTHOS_OK:
+        return f"❌ Mythos unavailable: {_MYTHOS_IMPORT_ERR}"
+    try:
+        target = {
+            "repo": "sample/local",
+            "repo_path": os.getenv("MYTHOS_SAMPLE_REPO", os.getcwd()),
+            "languages": ["python"],
+            "frameworks": [],
+            "dependencies": [],
+            "harness_dir": "/tmp/mythos-sample",
+        }
+        os.makedirs(target["harness_dir"], exist_ok=True)
+        orch = build_default_orchestrator(max_iterations=1)
+        dossier = orch.run_campaign(target)
+        return _json.dumps(dossier, indent=2, default=str)[:20000]
+    except Exception as e:  # noqa: BLE001
+        return f"❌ Sample campaign error: {type(e).__name__}: {e}"
+
+
+def _start_mythos_api_server_thread() -> None:
+    """Boot the FastAPI productization plane in-process when MYTHOS_API=1."""
+    if os.getenv("MYTHOS_API", "0").lower() not in ("1", "true", "yes", "on"):
+        return
+    if not _MYTHOS_OK:
+        ui_log(f"Mythos API requested but package unavailable: {_MYTHOS_IMPORT_ERR}", "MYTHOS")
+        return
+    try:
+        import uvicorn  # type: ignore
+        from mythos.api.fastapi_server import app as _mythos_app
+        if _mythos_app is None:
+            ui_log("Mythos API requested but FastAPI not installed", "MYTHOS")
+            return
+        port = int(os.getenv("MYTHOS_API_PORT", "7862"))
+
+        def _serve():
+            try:
+                uvicorn.run(_mythos_app, host="0.0.0.0", port=port, log_level="warning")
+            except Exception as exc:  # noqa: BLE001
+                ui_log(f"Mythos API thread crashed: {exc}", "MYTHOS")
+
+        threading.Thread(target=_serve, daemon=True, name="mythos-api").start()
+        ui_log(f"Mythos productization API listening on :{port}", "MYTHOS")
+    except Exception as exc:  # noqa: BLE001
+        ui_log(f"Mythos API boot skipped: {exc}", "MYTHOS")
+
+
 if __name__ == "__main__":
     ui_log(f"Rhodawk AI v3.0 starting — Tenant: {TENANT_ID} | Model: {MODEL}")
+    ui_log(f"Mythos: {'enabled' if _MYTHOS_OK else 'unavailable: ' + _MYTHOS_IMPORT_ERR} "
+           f"| Multi-agent loop: {'ON' if mythos_enabled() else 'OFF'}", "MYTHOS")
 
     # MINOR BUG FIX: Pre-warm the embedding model in a background thread so the
     # first real retrieval call does not block on a multi-second model download.
@@ -2398,5 +2551,8 @@ if __name__ == "__main__":
     ui_log("Starting webhook server on port 7861...")
     start_webhook_server()
     ui_log("Webhook server running. Launching dashboard...")
+
+    # Boot Mythos productization API (no-op unless MYTHOS_API=1).
+    _start_mythos_api_server_thread()
     port = int(os.environ.get("PORT", 7860))
     demo.launch(server_name="0.0.0.0", server_port=port, share=False, show_error=True)

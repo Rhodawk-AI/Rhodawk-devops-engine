@@ -166,6 +166,11 @@
         "FETCH_ALLOWED_DOMAINS": "pypi.org,api.pypi.org,registry.npmjs.org,crates.io,deps.dev,socket.dev,api.socket.dev"
       }
     },
+    "reconnaissance-mcp": {
+      "command": "python",
+      "args": ["-m", "mythos.mcp.reconnaissance_mcp"],
+      "description": "Mythos: language/framework/dependency fingerprinting + attack-surface enumeration"
+    },
     "static-analysis-mcp": {
       "command": "python",
       "args": ["-m", "mythos.mcp.static_analysis_mcp"],
