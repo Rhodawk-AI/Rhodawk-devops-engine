@@ -45,7 +45,13 @@ HERMES_FAST_MODEL  = os.getenv("HERMES_FAST_MODEL", "deepseek/deepseek-v3:free")
 OPENROUTER_BASE    = "https://openrouter.ai/api/v1"
 
 _log_lock = threading.Lock()
-_hermes_logs: list[str] = []
+
+# ARCHITECT stability fix: bounded ring buffer instead of an unbounded list
+# (10 000 lines × ~120 B ≈ 1.2 MB ceiling).  Both tail-trim cost and memory
+# leak class are eliminated.
+import collections as _collections
+_HERMES_LOG_CAP = int(os.getenv("HERMES_LOG_CAP", "10000"))
+_hermes_logs: _collections.deque = _collections.deque(maxlen=_HERMES_LOG_CAP)
 
 
 def hermes_log(msg: str, level: str = "HERMES"):
@@ -60,13 +66,41 @@ def hermes_log(msg: str, level: str = "HERMES"):
     print(line)
     with _log_lock:
         _hermes_logs.append(line)
-        if len(_hermes_logs) > 500:
-            _hermes_logs.pop(0)
 
 
 def get_hermes_logs() -> list[str]:
     with _log_lock:
         return list(_hermes_logs)
+
+
+# ── ARCHITECT stability fix: durable HermesSession persistence ────────────
+_HERMES_SESSION_DIR = os.getenv("HERMES_SESSION_DIR", "/data/hermes")
+
+
+def persist_hermes_session(session) -> str | None:
+    """Atomically persist a HermesSession dataclass to disk after each phase.
+    Best-effort — never raises, returns the on-disk path or None."""
+    try:
+        import dataclasses
+        import json as _json
+        os.makedirs(_HERMES_SESSION_DIR, exist_ok=True)
+        sid = getattr(session, "session_id", "unknown")
+        path = os.path.join(_HERMES_SESSION_DIR, f"{sid}.json")
+        tmp = path + ".tmp"
+        if dataclasses.is_dataclass(session):
+            blob = dataclasses.asdict(session)
+            # phase enum → str
+            for k, v in list(blob.items()):
+                if hasattr(v, "value"):
+                    blob[k] = v.value
+        else:
+            blob = {"session_id": sid, "raw": str(session)}
+        with open(tmp, "w", encoding="utf-8") as fh:
+            _json.dump(blob, fh, default=str, indent=2)
+        os.replace(tmp, path)
+        return path
+    except Exception:  # noqa: BLE001
+        return None
 
 
 # ──────────────────────────────────────────────────────────────
@@ -565,10 +599,14 @@ def run_hermes_research(
         log(f"Running ACTS consensus on {len(session.findings)} finding(s)...", "CONSENSUS")
         session.phase = ResearchPhase.CONSENSUS
         _run_acts_consensus(session)
+        persist_hermes_session(session)
 
     session.phase = ResearchPhase.DISCLOSURE
     session.completed_at = time.strftime("%Y-%m-%dT%H:%M:%SZ")
     log(f"Session complete — {len(session.findings)} finding(s) pending human approval", "DISCLOSURE")
+    # ARCHITECT stability fix: persist the final session blob so a process
+    # restart never loses operator-visible findings.
+    persist_hermes_session(session)
     return session
 
 

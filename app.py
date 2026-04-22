@@ -2109,6 +2109,62 @@ GET  /webhook/queue     — Current job status (JSON)
                                    outputs=mythos_run_box)
             demo_mythos_load = mythos_status_box
 
+        # ── TAB 9c: ARCHITECT control plane ───────────────────
+        # Surfaces the ARCHITECT masterplan runtime: skill registry stats,
+        # model-tier router, EmbodiedOS bridge wiring, autonomous night-mode
+        # status. Optional — degrades gracefully when the architect package
+        # is missing.
+        with gr.Tab("🏛 ARCHITECT"):
+            try:
+                from architect import (
+                    ARCHITECT_VERSION, model_router as _arch_router,
+                    skill_registry as _arch_skills,
+                    embodied_bridge as _arch_bridge,
+                )
+                _arch_loaded = True
+                _arch_err = ""
+            except Exception as _e:  # noqa: BLE001
+                _arch_loaded = False
+                _arch_err = f"{type(_e).__name__}: {_e}"
+                ARCHITECT_VERSION = "unavailable"
+
+            gr.Markdown(
+                f"### ARCHITECT — Superhuman Autonomous Security Agent v{ARCHITECT_VERSION}\n"
+                "Runtime control-plane for the ARCHITECT masterplan. Owns the "
+                "model-tier router, skill registry, EmbodiedOS bridge, and the "
+                "autonomous night-mode bug-bounty loop. Opt in with "
+                "`ARCHITECT_NIGHTMODE=1`."
+            )
+            arch_status_box = gr.TextArea(
+                label="ARCHITECT status", lines=22, interactive=False)
+
+            def _arch_status() -> str:
+                import json as _j
+                if not _arch_loaded:
+                    return f"ARCHITECT package failed to load: {_arch_err}"
+                payload = {
+                    "version": ARCHITECT_VERSION,
+                    "model_router": {
+                        "budget": _arch_router.budget_status(),
+                        "routes": _arch_router.all_routes(),
+                    },
+                    "skill_registry": _arch_skills.stats(),
+                    "embodied_channels": _arch_bridge.channels(),
+                    "nightmode_enabled": os.getenv("ARCHITECT_NIGHTMODE", "0"),
+                    "nightmode_hour": os.getenv("ARCHITECT_NIGHTMODE_HOUR", "18"),
+                    "acts_gate": float(os.getenv("ARCHITECT_ACTS_GATE", "0.72")),
+                }
+                return _j.dumps(payload, indent=2, default=str)
+
+            with gr.Row():
+                gr.Button("🔄 Refresh ARCHITECT Status", variant="secondary").click(
+                    _arch_status, outputs=arch_status_box)
+                gr.Button("🌙 Run Night-Mode Cycle Now", variant="primary").click(
+                    lambda: (__import__("architect.nightmode",
+                                       fromlist=["run_one_cycle"]).run_one_cycle()
+                             if _arch_loaded else "ARCHITECT not loaded"),
+                    outputs=arch_status_box)
+
         # ── TAB 10: ARCHITECTURE ──────────────────────────────
         with gr.Tab("ℹ️ Architecture"):
             compliance_out = gr.Textbox(label="Compliance Export", interactive=False)
@@ -2555,4 +2611,11 @@ if __name__ == "__main__":
     # Boot Mythos productization API (no-op unless MYTHOS_API=1).
     _start_mythos_api_server_thread()
     port = int(os.environ.get("PORT", 7860))
+    # ── ARCHITECT autonomous night-mode (opt-in via ARCHITECT_NIGHTMODE=1) ──
+    try:
+        from architect import nightmode as _arch_nm
+        _arch_nm.start_in_background()
+    except Exception as _e:  # noqa: BLE001
+        print(f"[ARCHITECT] night-mode scheduler not started: {_e}")
+
     demo.launch(server_name="0.0.0.0", server_port=port, share=False, show_error=True)

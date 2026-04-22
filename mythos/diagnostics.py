@@ -82,7 +82,13 @@ def mcp_check() -> dict[str, Any]:
     out: dict[str, Any] = {}
     for name in ("static_analysis_mcp", "dynamic_analysis_mcp",
                  "exploit_generation_mcp", "vulnerability_database_mcp",
-                 "web_security_mcp", "reconnaissance_mcp"):
+                 "web_security_mcp", "reconnaissance_mcp",
+                 # ARCHITECT additions
+                 "browser_agent_mcp", "scope_parser_mcp",
+                 "subdomain_enum_mcp", "httpx_probe_mcp",
+                 "shodan_mcp", "wayback_mcp",
+                 "frida_runtime_mcp", "ghidra_bridge_mcp",
+                 "can_bus_mcp", "sdr_analysis_mcp"):
         try:
             mod = __import__(f"mythos.mcp.{name}", fromlist=["server"])
             out[name] = {"tools": [t["name"] for t in mod.server.list_tools()]}

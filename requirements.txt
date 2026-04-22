@@ -44,3 +44,15 @@ pydantic>=2.6.0
 # stable-baselines3>=2.3.0  # § 4.5 RL planner backend (alt)
 # pwntools>=4.12.0          # § 4.4 exploit synthesis (Linux only)
 # frida>=16.0.0             # § 4.3 dynamic instrumentation
+
+# ─── ARCHITECT masterplan dependencies (see ARCHITECT_MASTERPLAN.md) ─────
+# Required at runtime in light-mode (no extra binaries):
+dnspython>=2.6.0
+# Optional heavy bridges — install when moving to the paid VPS / lab rig:
+# playwright>=1.44.0           # browser-agent-mcp (run `playwright install chromium`)
+# python-can>=4.3.0            # can-bus-mcp (automotive)
+# scapy>=2.5.0                 # network-protocol fuzzing
+# pymodbus>=3.6.0              # ics-scada
+# python-snap7>=1.3            # ics-scada (Siemens S7)
+# opcua>=0.98.13               # ics-scada (OPC-UA)
+# rtl-sdr / hackrf-host (system pkgs) for sdr-analysis-mcp

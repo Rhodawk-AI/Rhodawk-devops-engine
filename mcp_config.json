@@ -9,7 +9,9 @@
   "mcpServers": {
     "fetch-docs": {
       "command": "uvx",
-      "args": ["mcp-server-fetch"],
+      "args": [
+        "mcp-server-fetch"
+      ],
       "description": "Fetch security docs, CVE advisories, exploit PoCs, and vendor bulletins",
       "env": {
         "FETCH_ALLOWED_DOMAINS": "docs.python.org,pypi.org,docs.github.com,packaging.python.org,peps.python.org,cwe.mitre.org,nvd.nist.gov,owasp.org,portswigger.net,hackerone.com,bugcrowd.com,cve.org,exploit-db.com,docs.rs,go.dev,nodejs.org,developer.mozilla.org,shodan.io,virustotal.com,osv.dev,snyk.io,vulners.com,seclists.org,packetstormsecurity.com,securityfocus.com,cisa.gov,zerodayinitiative.com,huntr.com,intigriti.com,yeswehack.com,vdp.hackerone.com,api.github.com,raw.githubusercontent.com,archive.org,web.archive.org,semgrep.dev,rules.semgrep.dev,github.com,security.snyk.io,opencve.io,vuldb.com,rapid7.com,metasploit.com,www.rapid7.com"
@@ -17,7 +19,10 @@
     },
     "github-manager": {
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-github"
+      ],
       "description": "GitHub API: create PRs, open security advisories, manage issues, query commit history",
       "env": {
         "GITHUB_PERSONAL_ACCESS_TOKEN": "__INJECTED_BY_APP_AT_RUNTIME__"
@@ -25,22 +30,37 @@
     },
     "filesystem-research": {
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/data/repo", "/tmp/research", "/tmp/findings"],
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/data/repo",
+        "/tmp/research",
+        "/tmp/findings"
+      ],
       "description": "Read-only access to cloned repos, research scratch space, and findings output"
     },
     "memory-store": {
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-memory"],
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-memory"
+      ],
       "description": "Persistent knowledge graph — stores exploit chains, CWE patterns, and cross-session vulnerability memory"
     },
     "sequential-thinking": {
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-sequential-thinking"
+      ],
       "description": "Structured chain-of-thought for complex multi-step vulnerability analysis and exploit reasoning"
     },
     "web-search": {
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-brave-search"],
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-brave-search"
+      ],
       "description": "Search CVEs, exploit PoCs, vendor advisories, bug bounty writeups, and security research papers",
       "env": {
         "BRAVE_API_KEY": "__INJECTED_BY_APP_AT_RUNTIME__"
@@ -48,12 +68,20 @@
     },
     "git-forensics": {
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-git", "--repository", "/data/repo"],
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-git",
+        "--repository",
+        "/data/repo"
+      ],
       "description": "Deep git history analysis: silent security patches (CAD), blame tracking, commit anomaly detection"
     },
     "postgres-intelligence": {
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-postgres"],
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-postgres"
+      ],
       "description": "Query findings DB, scan history, and vulnerability intelligence store",
       "env": {
         "DATABASE_URL": "__INJECTED_BY_APP_AT_RUNTIME__"
@@ -61,12 +89,21 @@
     },
     "sqlite-findings": {
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-sqlite", "--db-path", "/data/rhodawk_findings.db"],
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-sqlite",
+        "--db-path",
+        "/data/rhodawk_findings.db"
+      ],
       "description": "Local findings store — fast queries on vulnerability metadata, CVSS scores, and bounty estimates"
     },
     "nuclei-scanner": {
       "command": "uvx",
-      "args": ["mcp-server-shell", "--allow-commands", "nuclei,nuclei-templates"],
+      "args": [
+        "mcp-server-shell",
+        "--allow-commands",
+        "nuclei,nuclei-templates"
+      ],
       "description": "Nuclei template-based vulnerability scanner — DAST, CVE detection, misconfig scanning",
       "env": {
         "NUCLEI_TEMPLATES_PATH": "/data/nuclei-templates",
@@ -75,7 +112,11 @@
     },
     "semgrep-sast": {
       "command": "uvx",
-      "args": ["mcp-server-shell", "--allow-commands", "semgrep"],
+      "args": [
+        "mcp-server-shell",
+        "--allow-commands",
+        "semgrep"
+      ],
       "description": "Semgrep SAST — taint analysis, CWE pattern matching, secrets detection across 30+ languages",
       "env": {
         "SEMGREP_APP_TOKEN": "__INJECTED_BY_APP_AT_RUNTIME__"
@@ -83,57 +124,101 @@
     },
     "trufflehog-secrets": {
       "command": "uvx",
-      "args": ["mcp-server-shell", "--allow-commands", "trufflehog"],
+      "args": [
+        "mcp-server-shell",
+        "--allow-commands",
+        "trufflehog"
+      ],
       "description": "TruffleHog v3 — high-signal secret scanning with 700+ detectors across git history"
     },
     "bandit-sast": {
       "command": "uvx",
-      "args": ["mcp-server-shell", "--allow-commands", "bandit"],
+      "args": [
+        "mcp-server-shell",
+        "--allow-commands",
+        "bandit"
+      ],
       "description": "Bandit Python SAST — AST-level detection of dangerous patterns, injection sinks, insecure APIs"
     },
     "pip-audit-sca": {
       "command": "uvx",
-      "args": ["mcp-server-shell", "--allow-commands", "pip-audit,pip"],
+      "args": [
+        "mcp-server-shell",
+        "--allow-commands",
+        "pip-audit,pip"
+      ],
       "description": "pip-audit SCA — known vulnerabilities in Python dependencies via OSV and PyPI Advisory DB"
     },
     "osv-scanner": {
       "command": "uvx",
-      "args": ["mcp-server-shell", "--allow-commands", "osv-scanner"],
+      "args": [
+        "mcp-server-shell",
+        "--allow-commands",
+        "osv-scanner"
+      ],
       "description": "OSV Scanner — multi-ecosystem SCA using the Open Source Vulnerability database (Google)"
     },
     "z3-formal-verifier": {
       "command": "uvx",
-      "args": ["mcp-server-shell", "--allow-commands", "python3"],
+      "args": [
+        "mcp-server-shell",
+        "--allow-commands",
+        "python3"
+      ],
       "description": "Z3 SMT solver — formal verification of integer bounds, overflow invariants, protocol properties"
     },
     "hypothesis-fuzzer": {
       "command": "uvx",
-      "args": ["mcp-server-shell", "--allow-commands", "python3,pytest,hypothesis"],
+      "args": [
+        "mcp-server-shell",
+        "--allow-commands",
+        "python3,pytest,hypothesis"
+      ],
       "description": "Hypothesis PBT fuzzer — property-based testing for arithmetic overflow, encoding, aliasing bugs"
     },
     "atheris-fuzzer": {
       "command": "uvx",
-      "args": ["mcp-server-shell", "--allow-commands", "python3,atheris"],
+      "args": [
+        "mcp-server-shell",
+        "--allow-commands",
+        "python3,atheris"
+      ],
       "description": "Atheris coverage-guided fuzzer — libFuzzer-backed Python fuzzing for parser and protocol bugs"
     },
     "angr-symbolic": {
       "command": "uvx",
-      "args": ["mcp-server-shell", "--allow-commands", "python3"],
+      "args": [
+        "mcp-server-shell",
+        "--allow-commands",
+        "python3"
+      ],
       "description": "angr symbolic execution — binary analysis, path exploration, constraint solving for native exploits"
     },
     "radon-complexity": {
       "command": "uvx",
-      "args": ["mcp-server-shell", "--allow-commands", "radon"],
+      "args": [
+        "mcp-server-shell",
+        "--allow-commands",
+        "radon"
+      ],
       "description": "Radon AST complexity analysis — cyclomatic complexity, Halstead metrics, attack surface ranking"
     },
     "ruff-linter": {
       "command": "uvx",
-      "args": ["mcp-server-shell", "--allow-commands", "ruff"],
+      "args": [
+        "mcp-server-shell",
+        "--allow-commands",
+        "ruff"
+      ],
       "description": "Ruff ultra-fast Python linter — detects anti-patterns that correlate with security bugs"
     },
     "aider-patcher": {
       "command": "uvx",
-      "args": ["mcp-server-shell", "--allow-commands", "aider"],
+      "args": [
+        "mcp-server-shell",
+        "--allow-commands",
+        "aider"
+      ],
       "description": "Aider AI code editor — applies LLM-generated patches with diff verification and test re-run",
       "env": {
         "OPENROUTER_API_KEY": "__INJECTED_BY_APP_AT_RUNTIME__"
@@ -141,7 +226,9 @@
     },
     "cve-intelligence": {
       "command": "uvx",
-      "args": ["mcp-server-fetch"],
+      "args": [
+        "mcp-server-fetch"
+      ],
       "description": "NVD/NIST CVE API — fetch full CVE details, CVSS vectors, CWE mappings, affected versions",
       "env": {
         "FETCH_ALLOWED_DOMAINS": "nvd.nist.gov,cve.org,cve.mitre.org,www.cvedetails.com,vulners.com,osv.dev,opencve.io",
@@ -150,7 +237,9 @@
     },
     "bounty-platform": {
       "command": "uvx",
-      "args": ["mcp-server-fetch"],
+      "args": [
+        "mcp-server-fetch"
+      ],
       "description": "Bug bounty platform APIs — HackerOne report submission, GitHub Security Advisories, Bugcrowd",
       "env": {
         "FETCH_ALLOWED_DOMAINS": "api.hackerone.com,api.bugcrowd.com,api.intigriti.com,api.yeswehack.com,api.github.com",
@@ -160,7 +249,9 @@
     },
     "supply-chain-monitor": {
       "command": "uvx",
-      "args": ["mcp-server-fetch"],
+      "args": [
+        "mcp-server-fetch"
+      ],
       "description": "Supply chain security — PyPI typosquatting, dependency confusion, malicious package detection",
       "env": {
         "FETCH_ALLOWED_DOMAINS": "pypi.org,api.pypi.org,registry.npmjs.org,crates.io,deps.dev,socket.dev,api.socket.dev"
@@ -168,33 +259,131 @@
     },
     "reconnaissance-mcp": {
       "command": "python",
-      "args": ["-m", "mythos.mcp.reconnaissance_mcp"],
+      "args": [
+        "-m",
+        "mythos.mcp.reconnaissance_mcp"
+      ],
       "description": "Mythos: language/framework/dependency fingerprinting + attack-surface enumeration"
     },
     "static-analysis-mcp": {
       "command": "python",
-      "args": ["-m", "mythos.mcp.static_analysis_mcp"],
+      "args": [
+        "-m",
+        "mythos.mcp.static_analysis_mcp"
+      ],
       "description": "Mythos: Tree-sitter CPG, Joern, CodeQL, Semgrep — deep semantic static analysis"
     },
     "dynamic-analysis-mcp": {
       "command": "python",
-      "args": ["-m", "mythos.mcp.dynamic_analysis_mcp"],
+      "args": [
+        "-m",
+        "mythos.mcp.dynamic_analysis_mcp"
+      ],
       "description": "Mythos: AFL++, KLEE, QEMU, Frida, GDB — coverage-guided + symbolic + instrumented dynamic analysis"
     },
     "exploit-generation-mcp": {
       "command": "python",
-      "args": ["-m", "mythos.mcp.exploit_generation_mcp"],
+      "args": [
+        "-m",
+        "mythos.mcp.exploit_generation_mcp"
+      ],
       "description": "Mythos: Pwntools, ROPGadget, heap kit, privesc KB — autonomous PoC synthesis"
     },
     "vulnerability-database-mcp": {
       "command": "python",
-      "args": ["-m", "mythos.mcp.vulnerability_database_mcp"],
+      "args": [
+        "-m",
+        "mythos.mcp.vulnerability_database_mcp"
+      ],
       "description": "Mythos: NVD, OSV, Exploit-DB lookup for prior-art correlation"
     },
     "web-security-mcp": {
       "command": "python",
-      "args": ["-m", "mythos.mcp.web_security_mcp"],
+      "args": [
+        "-m",
+        "mythos.mcp.web_security_mcp"
+      ],
       "description": "Mythos: OWASP ZAP, nuclei, sqlmap orchestration for web targets"
+    },
+    "browser-agent-mcp": {
+      "command": "python",
+      "args": [
+        "-m",
+        "mythos.mcp.browser_agent_mcp"
+      ],
+      "description": "ARCHITECT: Playwright-driven live browser for web app testing (navigate/click/inject/screenshot)"
+    },
+    "scope-parser-mcp": {
+      "command": "python",
+      "args": [
+        "-m",
+        "mythos.mcp.scope_parser_mcp"
+      ],
+      "description": "ARCHITECT: HackerOne / Bugcrowd / Intigriti scope ingestion + raw policy parser"
+    },
+    "subdomain-enum-mcp": {
+      "command": "python",
+      "args": [
+        "-m",
+        "mythos.mcp.subdomain_enum_mcp"
+      ],
+      "description": "ARCHITECT: subfinder + amass + dnsx + crt.sh subdomain enumeration"
+    },
+    "httpx-probe-mcp": {
+      "command": "python",
+      "args": [
+        "-m",
+        "mythos.mcp.httpx_probe_mcp"
+      ],
+      "description": "ARCHITECT: concurrent HTTP(S) probing + tech fingerprint"
+    },
+    "shodan-mcp": {
+      "command": "python",
+      "args": [
+        "-m",
+        "mythos.mcp.shodan_mcp"
+      ],
+      "description": "ARCHITECT: passive recon via the Shodan REST API"
+    },
+    "wayback-mcp": {
+      "command": "python",
+      "args": [
+        "-m",
+        "mythos.mcp.wayback_mcp"
+      ],
+      "description": "ARCHITECT: Wayback Machine + URLScan historical-URL miner"
+    },
+    "frida-runtime-mcp": {
+      "command": "python",
+      "args": [
+        "-m",
+        "mythos.mcp.frida_runtime_mcp"
+      ],
+      "description": "ARCHITECT: live Frida instrumentation sessions (mobile / native runtime)"
+    },
+    "ghidra-bridge-mcp": {
+      "command": "python",
+      "args": [
+        "-m",
+        "mythos.mcp.ghidra_bridge_mcp"
+      ],
+      "description": "ARCHITECT: headless Ghidra / radare2 binary analysis bridge"
+    },
+    "can-bus-mcp": {
+      "command": "python",
+      "args": [
+        "-m",
+        "mythos.mcp.can_bus_mcp"
+      ],
+      "description": "ARCHITECT: automotive CAN-bus + UDS (ISO 14229) wrapper"
+    },
+    "sdr-analysis-mcp": {
+      "command": "python",
+      "args": [
+        "-m",
+        "mythos.mcp.sdr_analysis_mcp"
+      ],
+      "description": "ARCHITECT: GNU Radio / rtl_sdr scripted RF capture & analysis"
     }
   }
 }
