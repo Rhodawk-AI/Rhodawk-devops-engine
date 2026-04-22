@@ -44,6 +44,15 @@ HERMES_MODEL       = os.getenv("HERMES_MODEL", "deepseek/deepseek-r1:free")
 HERMES_FAST_MODEL  = os.getenv("HERMES_FAST_MODEL", "deepseek/deepseek-v3:free")
 OPENROUTER_BASE    = "https://openrouter.ai/api/v1"
 
+# ── DigitalOcean Serverless Inference (PRIMARY provider) ────────────────
+# OpenAI-compatible REST API. We POST to /chat/completions just like
+# OpenRouter; only the base URL, auth header, and model name differ.
+DO_INFERENCE_API_KEY = os.getenv("DO_INFERENCE_API_KEY", "") or os.getenv("DIGITALOCEAN_INFERENCE_KEY", "")
+DO_INFERENCE_BASE    = os.getenv("DO_INFERENCE_BASE_URL", "https://inference.do-ai.run/v1").rstrip("/")
+# Default DO model used when the caller hands us an `openrouter/...` model
+# string (which won't exist on DO). Override with HERMES_DO_MODEL.
+DO_HERMES_MODEL      = os.getenv("HERMES_DO_MODEL", "llama3.3-70b-instruct")
+
 _log_lock = threading.Lock()
 
 # ARCHITECT stability fix: bounded ring buffer instead of an unbounded list
@@ -410,21 +419,27 @@ Or to signal completion:
 _RATE_LIMIT_BACKOFF_DELAYS = [15, 30, 60]  # seconds — exponential backoff for 429s
 
 
-def _hermes_llm_call(messages: list[dict], model: str = None, timeout: int = 120) -> dict:
-    """
-    Call the Hermes LLM with exponential backoff on rate-limit (429) responses.
-    Three retries before giving up — prevents a single 429 from aborting a session.
-    """
-    if not OPENROUTER_API_KEY:
-        return {"done": True, "summary": "OPENROUTER_API_KEY not set"}
+def _strip_provider_prefix(model: str) -> str:
+    """Strip OpenRouter / OpenAI provider prefixes so we can re-target a
+    model string at a different provider."""
+    for prefix in ("openrouter/", "openai/"):
+        if model.startswith(prefix):
+            return model[len(prefix):]
+    return model
 
-    model = model or HERMES_MODEL
+
+def _post_chat_completion(
+    base_url: str, api_key: str, model: str, messages: list[dict],
+    timeout: int, extra_headers: dict | None = None,
+) -> dict:
+    """Single OpenAI-compatible POST. Raises on non-2xx; returns parsed JSON
+    from the assistant message."""
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "HTTP-Referer": "https://rhodawk.ai",
-        "X-Title": "Rhodawk Hermes Orchestrator",
     }
+    if extra_headers:
+        headers.update(extra_headers)
     payload = {
         "model": model,
         "messages": messages,
@@ -432,34 +447,94 @@ def _hermes_llm_call(messages: list[dict], model: str = None, timeout: int = 120
         "max_tokens": 2048,
         "response_format": {"type": "json_object"},
     }
+    resp = requests.post(
+        f"{base_url}/chat/completions",
+        headers=headers, json=payload, timeout=timeout,
+    )
+    resp.raise_for_status()
+    content = resp.json()["choices"][0]["message"]["content"]
+    return json.loads(content)
+
+
+def _hermes_llm_call(messages: list[dict], model: str = None, timeout: int = 120) -> dict:
+    """
+    Call the Hermes LLM with DigitalOcean Serverless Inference as the
+    PRIMARY provider and OpenRouter as the FALLBACK. Each provider gets
+    exponential backoff on 429 rate-limit responses before failing over.
+
+    Order of operations:
+      1. Try DigitalOcean (DO_INFERENCE_API_KEY) — fastest, paid endpoint.
+      2. On any non-recoverable failure or exhausted rate-limit retries,
+         fall back to OpenRouter (OPENROUTER_API_KEY).
+      3. If neither is configured, return a graceful no-op.
+    """
+    requested_model = model or HERMES_MODEL
+
+    providers: list[tuple[str, str, str, str, dict]] = []
+    if DO_INFERENCE_API_KEY:
+        do_model = (
+            _strip_provider_prefix(requested_model)
+            if requested_model.startswith(("openai/",))
+            else DO_HERMES_MODEL
+        )
+        providers.append(
+            ("DigitalOcean", DO_INFERENCE_BASE, DO_INFERENCE_API_KEY, do_model, {})
+        )
+    if OPENROUTER_API_KEY:
+        or_model = _strip_provider_prefix(requested_model) if "/" in requested_model else requested_model
+        # OpenRouter expects models in `vendor/name` form — only re-add the
+        # prefix when the caller passed an `openai/...` (DO-shaped) string.
+        if requested_model.startswith("openai/"):
+            or_model = HERMES_MODEL  # fall back to default OR-shaped model
+        providers.append(
+            ("OpenRouter", OPENROUTER_BASE, OPENROUTER_API_KEY, or_model,
+             {"HTTP-Referer": "https://rhodawk.ai",
+              "X-Title": "Rhodawk Hermes Orchestrator"})
+        )
+
+    if not providers:
+        return {"done": True,
+                "summary": "Neither DO_INFERENCE_API_KEY nor OPENROUTER_API_KEY is set"}
 
     last_error: Exception | None = None
-    for attempt, backoff in enumerate([0] + _RATE_LIMIT_BACKOFF_DELAYS):
-        if backoff:
-            hermes_log(f"Rate limit hit — waiting {backoff}s before retry {attempt}/{len(_RATE_LIMIT_BACKOFF_DELAYS)}", "WARN")
-            time.sleep(backoff)
-        try:
-            resp = requests.post(
-                f"{OPENROUTER_BASE}/chat/completions",
-                headers=headers, json=payload, timeout=timeout,
-            )
-            if resp.status_code == 429:
-                last_error = Exception(f"HTTP 429 rate limit (attempt {attempt + 1})")
-                hermes_log(str(last_error), "WARN")
-                continue
-            resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"]
-            return json.loads(content)
-        except Exception as e:
-            if "429" in str(e):
+    for idx, (name, base_url, api_key, prov_model, extra_headers) in enumerate(providers):
+        hermes_log(f"LLM call → {name} ({prov_model})", "HERMES")
+        for attempt, backoff in enumerate([0] + _RATE_LIMIT_BACKOFF_DELAYS):
+            if backoff:
+                hermes_log(
+                    f"{name} rate limit — waiting {backoff}s before retry "
+                    f"{attempt}/{len(_RATE_LIMIT_BACKOFF_DELAYS)}", "WARN")
+                time.sleep(backoff)
+            try:
+                return _post_chat_completion(
+                    base_url, api_key, prov_model, messages, timeout,
+                    extra_headers=extra_headers,
+                )
+            except requests.HTTPError as e:
+                status = getattr(e.response, "status_code", None)
+                if status == 429:
+                    last_error = e
+                    hermes_log(f"{name} HTTP 429 (attempt {attempt + 1})", "WARN")
+                    continue
                 last_error = e
-                hermes_log(f"Rate limit exception: {e}", "WARN")
-                continue
-            hermes_log(f"LLM call failed: {e}", "WARN")
-            return {"done": True, "summary": f"LLM error: {e}"}
+                hermes_log(f"{name} HTTP {status} — {e}", "WARN")
+                break  # non-rate-limit HTTP error → fail over to next provider
+            except Exception as e:
+                if "429" in str(e):
+                    last_error = e
+                    hermes_log(f"{name} rate limit exception: {e}", "WARN")
+                    continue
+                last_error = e
+                hermes_log(f"{name} call failed: {e}", "WARN")
+                break
 
-    hermes_log(f"LLM call exhausted all retries. Last error: {last_error}", "WARN")
-    return {"done": True, "summary": f"LLM rate limit — all retries exhausted: {last_error}"}
+        if idx < len(providers) - 1:
+            hermes_log(f"{name} exhausted — failing over to "
+                       f"{providers[idx + 1][0]}", "WARN")
+
+    hermes_log(f"All providers exhausted. Last error: {last_error}", "FAIL")
+    return {"done": True,
+            "summary": f"LLM providers exhausted (DO + OpenRouter): {last_error}"}
 
 
 # ──────────────────────────────────────────────────────────────

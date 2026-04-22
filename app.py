@@ -115,8 +115,29 @@ _active_runtime_lock = threading.Lock()
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_REPO = os.getenv("GITHUB_REPO", "")          # Optional — can be set via chat inbox
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+
+# ── DigitalOcean Serverless Inference (PRIMARY) ──────────────────────────
+# OpenAI-compatible endpoint. Uses an OpenAI-style API surface so we can
+# reuse aider via --openai-api-base / --openai-api-key.
+# Get an API key from: https://cloud.digitalocean.com/gen-ai/agents (Inference)
+DO_INFERENCE_API_KEY = os.getenv("DO_INFERENCE_API_KEY") or os.getenv("DIGITALOCEAN_INFERENCE_KEY")
+DO_INFERENCE_BASE_URL = os.getenv("DO_INFERENCE_BASE_URL", "https://inference.do-ai.run/v1").rstrip("/")
+DO_INFERENCE_MODEL = os.getenv("DO_INFERENCE_MODEL", "llama3.3-70b-instruct")
+
 TENANT_ID = os.getenv("RHODAWK_TENANT_ID", "default")
-MODEL = os.getenv("RHODAWK_MODEL", "openrouter/qwen/qwen-2.5-coder-32b-instruct:free")
+# Default Aider model — DO inference primary, OpenRouter fallback.
+# When DO_INFERENCE_API_KEY is set we hand aider an `openai/<model>` route
+# pointed at DigitalOcean. Otherwise we fall back to the OpenRouter model.
+_DEFAULT_AIDER_MODEL = (
+    f"openai/{DO_INFERENCE_MODEL}" if DO_INFERENCE_API_KEY
+    else "openrouter/qwen/qwen-2.5-coder-32b-instruct:free"
+)
+MODEL = os.getenv("RHODAWK_MODEL", _DEFAULT_AIDER_MODEL)
+# Explicit fallback model (always OpenRouter) — used if DO inference fails.
+FALLBACK_MODEL = os.getenv(
+    "RHODAWK_FALLBACK_MODEL",
+    "openrouter/qwen/qwen-2.5-coder-32b-instruct:free",
+)
 RED_TEAM_ENABLED = os.getenv("RHODAWK_RED_TEAM_ENABLED", "true").lower() != "false"
 PAID_API_KEY_WARNING = (
     "Please use a PAID API KEY without rate limits. Free-tier API keys usually hit "
@@ -595,25 +616,80 @@ def setup_target_venv() -> str:
 # ──────────────────────────────────────────────────────────────
 # AIDER RUNNER
 # ──────────────────────────────────────────────────────────────
+def _aider_provider_options(model: str) -> tuple[list[str], dict[str, str]]:
+    """
+    Return (extra_cli_args, env_overrides) for a given aider --model string.
+    Routes ``openai/<model>`` calls through DigitalOcean Serverless Inference,
+    and ``openrouter/<model>`` calls through OpenRouter.
+    """
+    env: dict[str, str] = {}
+    args: list[str] = []
+    if model.startswith("openai/") and DO_INFERENCE_API_KEY:
+        # DigitalOcean OpenAI-compatible endpoint.
+        env["OPENAI_API_KEY"] = DO_INFERENCE_API_KEY
+        env["OPENAI_API_BASE"] = DO_INFERENCE_BASE_URL
+        # Some litellm versions also read these:
+        env["OPENAI_BASE_URL"] = DO_INFERENCE_BASE_URL
+        args += ["--openai-api-base", DO_INFERENCE_BASE_URL,
+                 "--openai-api-key", DO_INFERENCE_API_KEY]
+    elif model.startswith("openrouter/") and OPENROUTER_API_KEY:
+        env["OPENROUTER_API_KEY"] = OPENROUTER_API_KEY
+    return args, env
+
+
+def _run_aider_once(model: str, prompt_path: str, valid_files: list[str]) -> tuple[str, int]:
+    extra_args, env_overrides = _aider_provider_options(model)
+    cmd = ["aider", "--model", model, "--yes", "--no-stream",
+           "--message-file", prompt_path] + extra_args + valid_files
+    return run_subprocess_safe(cmd, cwd=REPO_DIR, timeout=600,
+                               env_overrides=env_overrides,
+                               raise_on_error=False)
+
+
 def run_aider(mcp_config_path: str, prompt: str, context_files: list[str]) -> tuple[str, int]:
+    """
+    Run aider with DigitalOcean Serverless Inference as PRIMARY and
+    OpenRouter as FALLBACK. If the primary call exits non-zero (rate
+    limit, provider outage, transient crash), we automatically retry the
+    same prompt against the OpenRouter fallback model.
+
+    Note: --mcp-config is NOT a supported aider CLI flag in any released
+    version of aider-chat (including 0.86.1). The mcp_config_path argument
+    is kept in the function signature for forward-compatibility but is not
+    forwarded to the subprocess until upstream adds the flag.
+    """
     fd, prompt_path = tempfile.mkstemp(prefix="aider_prompt_", suffix=".txt")
     try:
         with os.fdopen(fd, "w") as f:
             f.write(prompt)
         valid = [f for f in context_files if os.path.exists(os.path.join(REPO_DIR, f))]
-        cmd = ["aider", "--model", MODEL, "--yes", "--no-stream",
-               "--message-file", prompt_path]
-        # NOTE: --mcp-config is NOT a supported aider CLI flag in any released
-        # version of aider-chat (including 0.86.1). Native MCP support was
-        # requested upstream (issue #3314) but never merged. Passing this flag
-        # caused aider to print usage text and exit non-zero on every single
-        # call, producing 0% fix rate. The mcp_config_path argument is kept in
-        # the function signature for forward-compatibility but is intentionally
-        # not forwarded to the aider subprocess until upstream adds the flag.
-        cmd += valid
-        return run_subprocess_safe(cmd, cwd=REPO_DIR, timeout=600,
-                                   env_overrides={"OPENROUTER_API_KEY": OPENROUTER_API_KEY},
-                                   raise_on_error=False)
+
+        # Build provider chain: primary first, fallback second (deduped).
+        chain: list[str] = []
+        for m in (MODEL, FALLBACK_MODEL):
+            if m and m not in chain:
+                # Skip a provider if its credentials aren't configured.
+                if m.startswith("openai/") and not DO_INFERENCE_API_KEY:
+                    continue
+                if m.startswith("openrouter/") and not OPENROUTER_API_KEY:
+                    continue
+                chain.append(m)
+        if not chain:
+            return ("No inference provider configured: set DO_INFERENCE_API_KEY "
+                    "or OPENROUTER_API_KEY", 1)
+
+        last_output, last_code = "", 1
+        for idx, model in enumerate(chain):
+            provider = "DigitalOcean" if model.startswith("openai/") else "OpenRouter"
+            ui_log(f"Aider attempt via {provider} ({model})", "INFO")
+            output, code = _run_aider_once(model, prompt_path, valid)
+            last_output, last_code = output, code
+            if code == 0:
+                return output, code
+            if idx < len(chain) - 1:
+                ui_log(f"{provider} failed (exit {code}) — falling back to "
+                       f"{chain[idx + 1]}", "WARN")
+        return last_output, last_code
     finally:
         try:
             os.unlink(prompt_path)
