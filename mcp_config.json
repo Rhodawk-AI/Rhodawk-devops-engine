@@ -384,6 +384,55 @@
         "mythos.mcp.sdr_analysis_mcp"
       ],
       "description": "ARCHITECT: GNU Radio / rtl_sdr scripted RF capture & analysis"
+    },
+    "scope-parser-mcp": {
+      "command": "python",
+      "args": [
+        "-m",
+        "mythos.mcp.scope_parser_mcp"
+      ],
+      "description": "ARCHITECT: HackerOne / Bugcrowd / Intigriti scope ingestion for night-mode",
+      "env": {
+        "HACKERONE_USERNAME": "__INJECTED_BY_APP_AT_RUNTIME__",
+        "HACKERONE_API_TOKEN": "__INJECTED_BY_APP_AT_RUNTIME__",
+        "BUGCROWD_API_TOKEN":  "__INJECTED_BY_APP_AT_RUNTIME__",
+        "INTIGRITI_API_TOKEN": "__INJECTED_BY_APP_AT_RUNTIME__"
+      }
+    },
+    "subdomain-enum-mcp": {
+      "command": "python",
+      "args": [
+        "-m",
+        "mythos.mcp.subdomain_enum_mcp"
+      ],
+      "description": "ARCHITECT: subfinder + amass + dnsx + crt.sh subdomain enumeration"
+    },
+    "wayback-mcp": {
+      "command": "python",
+      "args": [
+        "-m",
+        "mythos.mcp.wayback_mcp"
+      ],
+      "description": "ARCHITECT: Wayback / CommonCrawl historical URL recall"
+    },
+    "httpx-probe-mcp": {
+      "command": "python",
+      "args": [
+        "-m",
+        "mythos.mcp.httpx_probe_mcp"
+      ],
+      "description": "ARCHITECT: httpx live-host probe + tech fingerprint"
+    },
+    "shodan-mcp": {
+      "command": "python",
+      "args": [
+        "-m",
+        "mythos.mcp.shodan_mcp"
+      ],
+      "description": "ARCHITECT: Shodan internet-exposure lookup",
+      "env": {
+        "SHODAN_API_KEY": "__INJECTED_BY_APP_AT_RUNTIME__"
+      }
     }
   }
 }

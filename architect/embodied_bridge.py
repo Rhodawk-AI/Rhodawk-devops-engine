@@ -118,6 +118,83 @@ def emit_status(message: str, level: str = "info") -> bool:
     return a or b
 
 
+# ── OpenClaw dispatch (Masterplan §5 — Phase 5) ────────────────────────────
+def dispatch_to_openclaw(
+    job_type: str,
+    payload: dict[str, Any],
+    *,
+    timeout: int = 15,
+) -> dict[str, Any]:
+    """
+    Send a long-running compute job to the OpenClaw GPU fleet.
+
+    ``job_type`` is one of:
+        - ``"fuzz_afl"``           — AFL++ campaign on a binary
+        - ``"klee_symbolic"``      — KLEE symbolic-execution run
+        - ``"lora_finetune"``      — incremental LoRA fine-tune of T5 local
+        - ``"differential_fuzz"``  — sibling-implementation diff fuzz
+        - ``"weight_scan"``        — picklescan / modelscan over weights
+
+    Returns a dict with ``{"dispatched": bool, "job_id": str, "status_url"}``.
+    The OpenClaw side acks immediately; results are pushed back via the
+    Hermes Agent webhook (see ``receive_openclaw_result`` below).
+    """
+    url = os.getenv("OPENCLAW_WEBHOOK_URL", "")
+    if not url:
+        LOG.warning("OPENCLAW_WEBHOOK_URL not set — skipping dispatch")
+        return {"dispatched": False, "reason": "no_webhook"}
+    body = {
+        "type": "openclaw.job",
+        "job_type": job_type,
+        "payload": payload,
+        "submitted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    try:
+        r = requests.post(url, json=body, timeout=timeout)
+        r.raise_for_status()
+        out = r.json() if r.content else {}
+        return {
+            "dispatched": True,
+            "job_id":     out.get("job_id"),
+            "status_url": out.get("status_url"),
+            "echo":       out,
+        }
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("OpenClaw dispatch failed: %s", exc)
+        return {"dispatched": False, "reason": str(exc)}
+
+
+def receive_openclaw_result(payload: dict[str, Any]) -> dict[str, Any]:
+    """
+    Webhook handler for results pushed back from the OpenClaw fleet.
+    Persists to the Hermes session store and forwards a status notice to
+    the operator.  Returns the normalised receipt for HTTP echo.
+    """
+    job_id = str(payload.get("job_id", "?"))
+    status = str(payload.get("status", "unknown"))
+    findings = payload.get("findings") or []
+    LOG.info("OpenClaw result received: job=%s status=%s findings=%d",
+             job_id, status, len(findings))
+
+    # Best-effort persistence to the Hermes session store.
+    try:
+        from hermes_orchestrator import persist_hermes_session  # type: ignore
+        persist_hermes_session({"openclaw_job": job_id,
+                                "status": status,
+                                "findings": findings,
+                                "raw": payload})
+    except Exception as exc:  # noqa: BLE001
+        LOG.debug("persist_hermes_session unavailable: %s", exc)
+
+    emit_status(
+        f"OpenClaw job `{job_id}` finished with status `{status}` "
+        f"({len(findings)} finding(s))",
+        "info",
+    )
+    return {"received": True, "job_id": job_id,
+            "findings_recorded": len(findings)}
+
+
 def channels() -> dict[str, bool]:
     return {
         "telegram": bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID")),
