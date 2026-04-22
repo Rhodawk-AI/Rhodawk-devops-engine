@@ -45,6 +45,29 @@ license: apache-2.0
 
 <div align="center">
 
+## 🚀 Mythos-Level Upgrade
+
+A complete blueprint for elevating Rhodawk to **Claude Mythos-class
+autonomous vulnerability research** lives under [`mythos/`](mythos/) — see
+[`mythos/MYTHOS_PLAN.md`](mythos/MYTHOS_PLAN.md) for the full living plan
+(multi-agent framework, probabilistic reasoning, advanced static / dynamic /
+exploit tooling, RL self-improvement, new MCP servers, FastAPI
+productization). Enable with `RHODAWK_MYTHOS=1` or hit the new productization
+API at `POST /v1/analyze_target` (run `uvicorn mythos.api.fastapi_server:app`).
+
+| Layer | Module |
+|---|---|
+| Multi-agent (Planner / Explorer / Executor) | `mythos/agents/` |
+| Probabilistic hypothesis engine + attack graphs | `mythos/reasoning/` |
+| Static (Tree-sitter, Joern, CodeQL, Semgrep) | `mythos/static/` |
+| Dynamic (AFL++, KLEE, QEMU, Frida, GDB) | `mythos/dynamic/` |
+| Exploit (Pwntools, ROPGadget, heap, privesc) | `mythos/exploit/` |
+| Self-improvement (RL, MLflow, LoRA, curriculum, episodic) | `mythos/learning/` |
+| New MCP servers (5×) | `mythos/mcp/` (registered in `mcp_config.json`) |
+| Productization API | `mythos/api/` |
+
+---
+
 ## What Rhodawk Actually Is
 
 </div>

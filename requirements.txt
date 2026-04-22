@@ -29,3 +29,18 @@ torch>=2.2.0
 angr>=9.2.0
 networkx>=3.0
 defusedxml>=0.7.1
+
+# ─── Mythos-level upgrade (see mythos/MYTHOS_PLAN.md) ────────────────────
+# Required for the productization API surface.
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.6.0
+# Optional: heavier capabilities — install on demand for full Mythos parity.
+# pyro-ppl>=1.9.0           # § 4.1 probabilistic reasoning (Bayesian backend)
+# pymc>=5.10.0              # § 4.1 probabilistic reasoning (alt backend)
+# tree-sitter-languages>=1.10.0  # § 4.2 Tree-sitter CPG bridge
+# mlflow>=2.12.0            # § 4.5 experiment tracking
+# ray[rllib]>=2.10.0        # § 4.5 RL planner backend
+# stable-baselines3>=2.3.0  # § 4.5 RL planner backend (alt)
+# pwntools>=4.12.0          # § 4.4 exploit synthesis (Linux only)
+# frida>=16.0.0             # § 4.3 dynamic instrumentation

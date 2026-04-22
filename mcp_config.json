@@ -165,6 +165,31 @@
       "env": {
         "FETCH_ALLOWED_DOMAINS": "pypi.org,api.pypi.org,registry.npmjs.org,crates.io,deps.dev,socket.dev,api.socket.dev"
       }
+    },
+    "static-analysis-mcp": {
+      "command": "python",
+      "args": ["-m", "mythos.mcp.static_analysis_mcp"],
+      "description": "Mythos: Tree-sitter CPG, Joern, CodeQL, Semgrep — deep semantic static analysis"
+    },
+    "dynamic-analysis-mcp": {
+      "command": "python",
+      "args": ["-m", "mythos.mcp.dynamic_analysis_mcp"],
+      "description": "Mythos: AFL++, KLEE, QEMU, Frida, GDB — coverage-guided + symbolic + instrumented dynamic analysis"
+    },
+    "exploit-generation-mcp": {
+      "command": "python",
+      "args": ["-m", "mythos.mcp.exploit_generation_mcp"],
+      "description": "Mythos: Pwntools, ROPGadget, heap kit, privesc KB — autonomous PoC synthesis"
+    },
+    "vulnerability-database-mcp": {
+      "command": "python",
+      "args": ["-m", "mythos.mcp.vulnerability_database_mcp"],
+      "description": "Mythos: NVD, OSV, Exploit-DB lookup for prior-art correlation"
+    },
+    "web-security-mcp": {
+      "command": "python",
+      "args": ["-m", "mythos.mcp.web_security_mcp"],
+      "description": "Mythos: OWASP ZAP, nuclei, sqlmap orchestration for web targets"
     }
   }
 }
