@@ -2,18 +2,51 @@
 # ─────────────────────────────────────────────────────────────────────
 # Rhodawk runtime bootstrap.
 #
-# 1. Launch the OpenClaude headless gRPC daemon for the DigitalOcean
+# 1. Launch the camofox-browser anti-detection browser server on
+#    127.0.0.1:9377 (used by the orchestrator via camofox_client.py).
+# 2. Launch the OpenClaude headless gRPC daemon for the DigitalOcean
 #    Inference provider on :50051 (PRIMARY).
-# 2. Launch the OpenClaude headless gRPC daemon for OpenRouter on
+# 3. Launch the OpenClaude headless gRPC daemon for OpenRouter on
 #    :50052 (FALLBACK) — only if OPENROUTER_API_KEY is present.
-# 3. Wait briefly for both to bind, then hand control to app.py which
-#    talks to them over gRPC.
+# 4. Wait briefly for everything to bind, then hand control to app.py
+#    which talks to them over gRPC + HTTP.
 # ─────────────────────────────────────────────────────────────────────
 set -eo pipefail
 
 OC_DIR=/opt/openclaude
+CAMOFOX_DIR=/opt/camofox
 LOG_DIR="${LOG_DIR:-/tmp}"
 mkdir -p "${LOG_DIR}"
+
+# ─── camofox-browser ─────────────────────────────────────────────────
+# Anti-detection Firefox-fork browser server.  Lazily downloads the
+# Camoufox engine (~300MB) on first launch into the user's home dir,
+# so the first start may take a minute.  Subsequent starts are fast.
+start_camofox() {
+    local entry="${CAMOFOX_DIR}/node_modules/@askjo/camofox-browser/server.js"
+    [[ -f "${entry}" ]] || entry="${CAMOFOX_DIR}/node_modules/camofox-browser/server.js"
+    if [[ ! -f "${entry}" ]]; then
+        echo "[entrypoint] camofox-browser not installed — skipping"
+        return 0
+    fi
+    echo "[entrypoint] starting camofox-browser on ${CAMOFOX_HOST:-127.0.0.1}:${CAMOFOX_PORT:-9377}"
+    (
+        cd "${CAMOFOX_DIR}"
+        PORT="${CAMOFOX_PORT:-9377}" \
+        HOST="${CAMOFOX_HOST:-127.0.0.1}" \
+        CAMOFOX_HEADLESS="${CAMOFOX_HEADLESS:-virtual}" \
+        CAMOFOX_PROFILE_DIR="${CAMOFOX_PROFILE_DIR:-/data/camofox/profiles}" \
+        CAMOFOX_COOKIES_DIR="${CAMOFOX_COOKIES_DIR:-/data/camofox/cookies}" \
+        CAMOFOX_API_KEY="${CAMOFOX_API_KEY:-}" \
+        PROXY_HOST="${PROXY_HOST:-}" \
+        PROXY_PORT="${PROXY_PORT:-}" \
+        PROXY_USERNAME="${PROXY_USERNAME:-}" \
+        PROXY_PASSWORD="${PROXY_PASSWORD:-}" \
+            node "${entry}" \
+                > "${LOG_DIR}/camofox.log" 2>&1 &
+        echo $! > "${LOG_DIR}/camofox.pid"
+    )
+}
 
 start_daemon() {
     local label=$1 port=$2 base_url=$3 api_key=$4 model=$5
@@ -37,6 +70,9 @@ start_daemon() {
         echo $! > "${LOG_DIR}/openclaude-${label}.pid"
     )
 }
+
+# camofox first — slowest to bind because of the lazy engine download.
+start_camofox
 
 # DigitalOcean Inference (PRIMARY)
 DO_BASE="${DO_INFERENCE_BASE_URL:-https://inference.do-ai.run/v1}"
