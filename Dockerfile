@@ -34,18 +34,20 @@ COPY --from=oven/bun:latest /usr/local/bin/bunx /usr/local/bin/bunx
 
 WORKDIR /build
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt mcp-server-fetch \
+RUN pip install --no-cache-dir -r requirements.txt \
+                mcp-server-fetch mcp-server-git mcp-server-sqlite \
                 grpcio==1.66.* grpcio-tools==1.66.* protobuf==5.*
 
 # MCP servers used by the runtime — installed globally so `npx -y …` is
 # instantaneous instead of resolving on every audit.
+# NOTE: `@modelcontextprotocol/server-git` and `@modelcontextprotocol/server-sqlite`
+# were removed from the npm registry (404) — they are now provided via the
+# Python packages `mcp-server-git` and `mcp-server-sqlite` installed above.
 RUN npm install -g --quiet \
         @modelcontextprotocol/server-github \
         @modelcontextprotocol/server-filesystem \
         @modelcontextprotocol/server-memory \
         @modelcontextprotocol/server-sequential-thinking \
-        @modelcontextprotocol/server-git \
-        @modelcontextprotocol/server-sqlite \
         @modelcontextprotocol/server-brave-search
 
 # ─── Stage 3: final runtime image ───────────────────────────────────────

@@ -67,10 +67,8 @@
       }
     },
     "git-forensics": {
-      "command": "npx",
+      "command": "mcp-server-git",
       "args": [
-        "-y",
-        "@modelcontextprotocol/server-git",
         "--repository",
         "/data/repo"
       ],
@@ -88,10 +86,8 @@
       }
     },
     "sqlite-findings": {
-      "command": "npx",
+      "command": "mcp-server-sqlite",
       "args": [
-        "-y",
-        "@modelcontextprotocol/server-sqlite",
         "--db-path",
         "/data/rhodawk_findings.db"
       ],
