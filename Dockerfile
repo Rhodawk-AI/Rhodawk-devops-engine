@@ -1,24 +1,11 @@
-# syntax=docker/dockerfile:1.7
-# ─────────────────────────────────────────────────────────────────────────
-# Rhodawk AI DevSecOps Engine — vendored OpenClaude architecture
-#
-# Stages:
-#   1. openclaude-builder  — uses Bun to compile vendor/openclaude → dist/cli.mjs
-#   2. base                — python:3.12-slim with system tooling, uv, Node, Bun
-#   3. runtime             — final image (non-root rhodawk user, EXPOSE 7860)
-#
-# Aider, litellm, configargparse and friends have been completely removed.
-# Code generation is now handled by the OpenClaude headless gRPC daemon
-# launched from entrypoint.sh.
-# ─────────────────────────────────────────────────────────────────────────
-
-ARG BUN_VERSION=1.1.42
+ARG BUN_VERSION=latest
 
 # ─── Stage 1: build the vendored OpenClaude bundle ──────────────────────
 FROM oven/bun:${BUN_VERSION} AS openclaude-builder
 WORKDIR /openclaude
-COPY vendor/openclaude/package.json vendor/openclaude/bun.lock ./
-RUN bun install --frozen-lockfile --no-progress
+# FIX: Ignored bun.lock and removed --frozen-lockfile to prevent version mismatch crashes
+COPY vendor/openclaude/package.json ./
+RUN bun install --no-progress
 COPY vendor/openclaude/ ./
 RUN bun run build && \
     test -s dist/cli.mjs && \
@@ -41,8 +28,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 # Bun (needed at runtime to launch the daemon: `bun run dev:grpc`)
-COPY --from=oven/bun:1.1.42 /usr/local/bin/bun /usr/local/bin/bun
-COPY --from=oven/bun:1.1.42 /usr/local/bin/bunx /usr/local/bin/bunx
+# FIX: Updated to pull from latest to match Stage 1
+COPY --from=oven/bun:latest /usr/local/bin/bun /usr/local/bin/bun
+COPY --from=oven/bun:latest /usr/local/bin/bunx /usr/local/bin/bunx
 
 WORKDIR /build
 COPY requirements.txt .
