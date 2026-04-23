@@ -441,12 +441,10 @@ def write_mcp_config() -> str:
                 "args": ["mcp-server-shell", "--allow-commands", "ruff"],
                 "description": "Ruff ultra-fast Python linter — anti-patterns correlating with security bugs"
             },
-            "aider-patcher": {
-                "command": "uvx",
-                "args": ["mcp-server-shell", "--allow-commands", "aider"],
-                "description": "Aider AI code editor — applies LLM-generated patches with diff verification and test re-run",
-                "env": {"OPENROUTER_API_KEY": _openrouter_key}
-            },
+            # aider-patcher removed — code generation now flows through the
+            # vendored OpenClaude headless gRPC daemon (see openclaude_grpc/).
+            # The model itself talks to the rest of the MCP suite directly,
+            # so no recursive "patcher" MCP server is needed.
             "cve-intelligence": {
                 "command": "uvx",
                 "args": ["mcp-server-fetch"],
@@ -616,85 +614,76 @@ def setup_target_venv() -> str:
 # ──────────────────────────────────────────────────────────────
 # AIDER RUNNER
 # ──────────────────────────────────────────────────────────────
-def _aider_provider_options(model: str) -> tuple[list[str], dict[str, str]]:
-    """
-    Return (extra_cli_args, env_overrides) for a given aider --model string.
-    Routes ``openai/<model>`` calls through DigitalOcean Serverless Inference,
-    and ``openrouter/<model>`` calls through OpenRouter.
-    """
-    env: dict[str, str] = {}
-    args: list[str] = []
-    if model.startswith("openai/") and DO_INFERENCE_API_KEY:
-        # DigitalOcean OpenAI-compatible endpoint.
-        env["OPENAI_API_KEY"] = DO_INFERENCE_API_KEY
-        env["OPENAI_API_BASE"] = DO_INFERENCE_BASE_URL
-        # Some litellm versions also read these:
-        env["OPENAI_BASE_URL"] = DO_INFERENCE_BASE_URL
-        args += ["--openai-api-base", DO_INFERENCE_BASE_URL,
-                 "--openai-api-key", DO_INFERENCE_API_KEY]
-    elif model.startswith("openrouter/") and OPENROUTER_API_KEY:
-        env["OPENROUTER_API_KEY"] = OPENROUTER_API_KEY
-    return args, env
+###############################################################################
+# OpenClaude gRPC bridge — replaces the legacy aider subprocess shell-out.
+#
+# Two daemons run side-by-side inside the container (see entrypoint.sh):
+#   :50051  → DigitalOcean Inference  (PRIMARY)
+#   :50052  → OpenRouter              (FALLBACK)
+# `run_openclaude` walks the chain in order, returning the first 0-exit
+# response, or the last failure if both providers reject the prompt.
+#
+# The signature mirrors the old `run_aider` exactly so every caller in this
+# module — the 15-step healing loop, conviction engine, adversarial review
+# wrappers — keeps working without modification.
+###############################################################################
+from openclaude_grpc import run_openclaude as _run_openclaude_bridge
 
-
-def _run_aider_once(model: str, prompt_path: str, valid_files: list[str]) -> tuple[str, int]:
-    extra_args, env_overrides = _aider_provider_options(model)
-    cmd = ["aider", "--model", model, "--yes", "--no-stream",
-           "--message-file", prompt_path] + extra_args + valid_files
-    return run_subprocess_safe(cmd, cwd=REPO_DIR, timeout=600,
-                               env_overrides=env_overrides,
-                               raise_on_error=False)
+# Provider chain configuration (resolved once at import time).
+_OPENCLAUDE_PRIMARY_PORT = (
+    int(os.getenv("OPENCLAUDE_GRPC_PORT_DO", "50051"))
+    if DO_INFERENCE_API_KEY else 0
+)
+_OPENCLAUDE_FALLBACK_PORT = (
+    int(os.getenv("OPENCLAUDE_GRPC_PORT_OR", "50052"))
+    if OPENROUTER_API_KEY else 0
+)
+_OPENCLAUDE_PRIMARY_MODEL = DO_INFERENCE_MODEL if DO_INFERENCE_API_KEY else ""
+_OPENCLAUDE_FALLBACK_MODEL = os.getenv(
+    "OPENROUTER_MODEL",
+    "qwen/qwen-2.5-coder-32b-instruct:free",
+)
 
 
 def run_aider(mcp_config_path: str, prompt: str, context_files: list[str]) -> tuple[str, int]:
+    """Backwards-compatible alias kept so existing call sites and tests do
+    not break. Internally delegates to the OpenClaude gRPC bridge."""
+    return run_openclaude(mcp_config_path, prompt, context_files)
+
+
+def run_openclaude(mcp_config_path: str, prompt: str,
+                   context_files: list[str]) -> tuple[str, int]:
+    """Issue one healing turn against the OpenClaude gRPC daemons.
+
+    Returns the same ``(combined_output, exit_code)`` tuple shape that
+    aider used to return so the rest of the orchestrator (validation
+    loop, SAST gate, conviction engine, red-team checks) plugs in
+    unchanged.
     """
-    Run aider with DigitalOcean Serverless Inference as PRIMARY and
-    OpenRouter as FALLBACK. If the primary call exits non-zero (rate
-    limit, provider outage, transient crash), we automatically retry the
-    same prompt against the OpenRouter fallback model.
+    if _OPENCLAUDE_PRIMARY_PORT == 0 and _OPENCLAUDE_FALLBACK_PORT == 0:
+        return (
+            "No inference provider configured: set DO_INFERENCE_API_KEY "
+            "or OPENROUTER_API_KEY",
+            1,
+        )
 
-    Note: --mcp-config is NOT a supported aider CLI flag in any released
-    version of aider-chat (including 0.86.1). The mcp_config_path argument
-    is kept in the function signature for forward-compatibility but is not
-    forwarded to the subprocess until upstream adds the flag.
-    """
-    fd, prompt_path = tempfile.mkstemp(prefix="aider_prompt_", suffix=".txt")
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(prompt)
-        valid = [f for f in context_files if os.path.exists(os.path.join(REPO_DIR, f))]
+    valid = [f for f in context_files
+             if os.path.exists(os.path.join(REPO_DIR, f))]
 
-        # Build provider chain: primary first, fallback second (deduped).
-        chain: list[str] = []
-        for m in (MODEL, FALLBACK_MODEL):
-            if m and m not in chain:
-                # Skip a provider if its credentials aren't configured.
-                if m.startswith("openai/") and not DO_INFERENCE_API_KEY:
-                    continue
-                if m.startswith("openrouter/") and not OPENROUTER_API_KEY:
-                    continue
-                chain.append(m)
-        if not chain:
-            return ("No inference provider configured: set DO_INFERENCE_API_KEY "
-                    "or OPENROUTER_API_KEY", 1)
-
-        last_output, last_code = "", 1
-        for idx, model in enumerate(chain):
-            provider = "DigitalOcean" if model.startswith("openai/") else "OpenRouter"
-            ui_log(f"Aider attempt via {provider} ({model})", "INFO")
-            output, code = _run_aider_once(model, prompt_path, valid)
-            last_output, last_code = output, code
-            if code == 0:
-                return output, code
-            if idx < len(chain) - 1:
-                ui_log(f"{provider} failed (exit {code}) — falling back to "
-                       f"{chain[idx + 1]}", "WARN")
-        return last_output, last_code
-    finally:
-        try:
-            os.unlink(prompt_path)
-        except OSError:
-            pass
+    return _run_openclaude_bridge(
+        mcp_config_path,
+        prompt,
+        valid,
+        repo_dir=REPO_DIR,
+        primary_port=_OPENCLAUDE_PRIMARY_PORT,
+        fallback_port=_OPENCLAUDE_FALLBACK_PORT,
+        primary_label="DigitalOcean",
+        fallback_label="OpenRouter",
+        primary_model=_OPENCLAUDE_PRIMARY_MODEL,
+        fallback_model=_OPENCLAUDE_FALLBACK_MODEL,
+        timeout=int(os.getenv("OPENCLAUDE_TIMEOUT", "600")),
+        log_fn=ui_log,
+    )
 
 
 # ──────────────────────────────────────────────────────────────

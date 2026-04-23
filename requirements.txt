@@ -4,11 +4,14 @@ uv>=0.7.0
 gitpython==3.1.46
 gradio>=5.49.0,<6
 jinja2==3.1.6
-# aider-chat is intentionally NOT listed here — it hard-pins
-# pillow==12.1.1 which conflicts with gradio (pillow<12) and litellm==1.75.0
-# which has a broken module surface (missing APIConnectionError, _logging).
-# The Dockerfile installs aider with --no-deps after this requirements file
-# resolves, plus a patched litellm and aider's actual runtime deps.
+
+# ─── Code-generation layer ───────────────────────────────────────────────
+# Aider-chat has been removed and replaced by the vendored OpenClaude
+# headless gRPC daemon (see vendor/openclaude/ + openclaude_grpc/).
+# The Dockerfile installs grpcio + grpcio-tools at build time so that
+# protobuf stub generation runs inside the build, not in this lock file.
+
+# ─── Static analysis / SAST ──────────────────────────────────────────────
 ruff
 tenacity
 bandit[toml]
@@ -16,6 +19,8 @@ pip-audit
 radon
 hypothesis[cli]>=6.100.0
 semgrep>=1.45.0
+
+# ─── ML / embeddings / vector store ──────────────────────────────────────
 sentence-transformers>=2.7.0
 sqlite-vec>=0.1.1
 pygithub>=2.3.0
@@ -28,35 +33,24 @@ z3-solver>=4.12.0
 qdrant-client>=1.9.0
 transformers>=4.40.0
 torch>=2.2.0
-# atheris removed: requires Clang + libFuzzer at compile time which is unavailable
-# on HuggingFace Space Docker images. Fuzzing falls back to Hypothesis automatically.
+
+# atheris removed: requires Clang + libFuzzer at compile time which is
+# unavailable on HuggingFace Space Docker images. Fuzzing falls back to
+# Hypothesis automatically.
 angr>=9.2.0
 networkx>=3.0
 defusedxml>=0.7.1
 
 # ─── Mythos-level upgrade (see mythos/MYTHOS_PLAN.md) ────────────────────
-# Required for the productization API surface.
 fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
 pydantic>=2.6.0
-# Optional: heavier capabilities — install on demand for full Mythos parity.
-# pyro-ppl>=1.9.0           # § 4.1 probabilistic reasoning (Bayesian backend)
-# pymc>=5.10.0              # § 4.1 probabilistic reasoning (alt backend)
-# tree-sitter-languages>=1.10.0  # § 4.2 Tree-sitter CPG bridge
-# mlflow>=2.12.0            # § 4.5 experiment tracking
-# ray[rllib]>=2.10.0        # § 4.5 RL planner backend
-# stable-baselines3>=2.3.0  # § 4.5 RL planner backend (alt)
-# pwntools>=4.12.0          # § 4.4 exploit synthesis (Linux only)
-# frida>=16.0.0             # § 4.3 dynamic instrumentation
 
 # ─── ARCHITECT masterplan dependencies (see ARCHITECT_MASTERPLAN.md) ─────
-# Required at runtime in light-mode (no extra binaries):
 dnspython>=2.6.0
-# Optional heavy bridges — install when moving to the paid VPS / lab rig:
-# playwright>=1.44.0           # browser-agent-mcp (run `playwright install chromium`)
-# python-can>=4.3.0            # can-bus-mcp (automotive)
-# scapy>=2.5.0                 # network-protocol fuzzing
-# pymodbus>=3.6.0              # ics-scada
-# python-snap7>=1.3            # ics-scada (Siemens S7)
-# opcua>=0.98.13               # ics-scada (OPC-UA)
-# rtl-sdr / hackrf-host (system pkgs) for sdr-analysis-mcp
+
+# ─── gRPC bridge to the OpenClaude daemon ────────────────────────────────
+# (Pinned again here as a safety net for editable installs / `pip install -r`
+#  in environments that bypass the Dockerfile.)
+grpcio>=1.66.0,<2.0.0
+protobuf>=5.0.0,<6.0.0

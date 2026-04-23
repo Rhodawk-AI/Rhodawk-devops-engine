@@ -71,17 +71,18 @@ and build behaviour (how the container is assembled).
 | 4 | `ad06d84` | Added `gitpython==3.1.46` to `requirements.txt`. | aider 0.86.2 hard-pins gitpython; pip's resolver was bouncing between our floor (`>=3.1.40`) and aider's pin. Pinning explicitly removes the resolver thrash. |
 | 5 | `a913714` | Switched the Space SDK from `gradio` to `docker` in `README.md` front-matter and bumped `gradio>=5.49.0,<6` in `requirements.txt`. | HF was auto-injecting `gradio[oauth,mcp]==5.29.0` because the Space was registered as `sdk: gradio`. That injection conflicted with aider's `pillow==12.1.1` pin. `sdk: docker` tells HF to use the existing Dockerfile verbatim, with no auto-injection. |
 | 6 | `dd4ccce` | Removed `aider-chat` from `requirements.txt` entirely. The Dockerfile now installs it with `--no-deps` plus a curated runtime-deps list. | Even with `sdk: docker`, aider's `pillow==12.1.1` pin still conflicted with gradio's `pillow<12` constraint at the resolver level. `--no-deps` lets gradio's pillow 11 win, and the curated dep list provides everything aider actually imports at runtime. |
+| 7 | *current* | **Aider eliminated entirely. Vendored OpenClaude headless gRPC daemon now drives every code-generation turn.** Two daemons (`:50051` DigitalOcean primary, `:50052` OpenRouter fallback) launched from `entrypoint.sh`. New Python bridge `openclaude_grpc/` exposes `run_openclaude(...)` with the legacy `(combined_output, exit_code)` return contract. `run_aider` is now a thin alias. | The `--no-deps + litellm 1.78.5 + curated 27-package list` workaround was a fragile patchwork; any aider/gradio/pillow upstream bump could re-break the build. OpenClaude is a single Bun-built bundle with no Python dependency surface and a stable gRPC contract, so the Dockerfile loses ~30 lines of dependency hacks. |
 
 **Net effect today.** The Space SDK is `docker`. The build runs the
-Dockerfile end-to-end. `requirements.txt` does **not** mention `aider-chat`.
-The Dockerfile installs requirements normally, then layers in
-(a) `aider-chat==0.86.2 --no-deps`, (b) `litellm==1.78.5 --no-deps --upgrade`,
-(c) a curated set of aider's actual runtime imports (configargparse,
-jsonschema, rich, prompt_toolkit, pyyaml, pathspec, diskcache, networkx,
-scipy, beautifulsoup4, pypandoc, flake8, importlib_resources, pyperclip,
-pexpect, json5, psutil, watchfiles, socksio, mixpanel, posthog, tree-sitter,
-grep_ast, oslex, tokenizers, google-generativeai, openai, diff-match-patch,
-soundfile, sounddevice).
+Dockerfile end-to-end in three stages: (1) Bun compiles
+`vendor/openclaude/` to `dist/cli.mjs`; (2) Python 3.12-slim with system
+tooling, uv, Node and Bun is provisioned; (3) the runtime image generates
+Python protobuf stubs from `vendor/openclaude/src/proto/openclaude.proto`
+into `openclaude_grpc/`. `requirements.txt` no longer mentions
+`aider-chat`, `litellm`, `configargparse`, or any of the other 27 curated
+aider runtime imports — they have all been deleted. `entrypoint.sh`
+boots the OpenClaude DO daemon on `:50051` and (when an OpenRouter key is
+present) the OpenClaude OR daemon on `:50052`, then `exec`s `app.py`.
 
 **Provider behaviour today.** When `DO_INFERENCE_API_KEY` is present the hot
 path uses DigitalOcean Serverless Inference at
@@ -94,41 +95,43 @@ When DO is absent the system silently runs OpenRouter-only.
 ## 2. Provider Routing — DigitalOcean Primary, OpenRouter Fallback
 <a id="2-provider-routing"></a>
 
-Two independent code paths need an LLM: **aider** (the patch generator) and
-**Hermes** (the multi-phase research orchestrator + adversarial reviewer).
-Both have been wired to the same provider chain.
+Two independent code paths need an LLM: **OpenClaude** (the patch
+generator, replaces aider) and **Hermes** (the multi-phase research
+orchestrator + adversarial reviewer). Both are wired to the same
+provider chain — DigitalOcean Inference primary, OpenRouter fallback.
 
-### 2.1 Aider path — `app.py::run_aider`
+### 2.1 OpenClaude path — `app.py::run_openclaude` (alias `run_aider`)
 
 ```
-caller passes model=None
+entrypoint.sh boots two OpenClaude headless gRPC daemons:
+  ┌─ DO_INFERENCE_API_KEY  → :50051  (PRIMARY,  llama3.3-70b-instruct)
+  └─ OPENROUTER_API_KEY    → :50052  (FALLBACK, qwen-2.5-coder-32b)
+
+run_openclaude(mcp_config_path, prompt, context_files):
   │
-  ├─► DEFAULT_MODEL  (constructed at import time)
-  │     ├── DO_INFERENCE_API_KEY set?  → "openai/llama3.3-70b-instruct"
-  │     └── otherwise                  → "openrouter/qwen/qwen-2.5-coder-32b-instruct:free"
+  ├─► writes /tmp/mcp_runtime.json (the daemon hot-reloads it per chat)
+  ├─► forwards prompt + valid context-file list to the bridge
   │
-  ├─► FALLBACK_MODELS list = ["openrouter/qwen/qwen-2.5-coder-32b-instruct:free"]
-  │
-  └─► provider chain executes [primary, *fallbacks]:
-        for each model m:
-          if m starts with "openai/" and DO_INFERENCE_API_KEY:
-              env OPENAI_API_KEY      = DO_INFERENCE_API_KEY
-              env OPENAI_API_BASE     = https://inference.do-ai.run/v1
-              env OPENAI_BASE_URL     = https://inference.do-ai.run/v1
-              args += --openai-api-base, --openai-api-key
-              run aider; if exit==0 → return
-          elif m starts with "openrouter/" and OPENROUTER_API_KEY:
-              env OPENROUTER_API_KEY  = OPENROUTER_API_KEY
-              run aider; if exit==0 → return
-          else: skip
-        if all skipped → "No inference provider configured" message
-        if all failed  → return last error with provider chain printed
+  └─► openclaude_grpc.run_openclaude builds the chain [primary, fallback]:
+        for each (port, label, model) in chain:
+          client = OpenClaudeClient(host=127.0.0.1, port=port)
+          if not client.wait_ready(15s): record + continue
+          result = client.chat(message, working_directory=REPO_DIR, model=model)
+              ├── streams text_chunk → result.stdout
+              ├── streams tool_start  → result.tool_calls + stdout marker
+              ├── streams tool_result → result.stdout / .stderr
+              ├── auto-replies "y" to any action_required prompt
+              └── on done event       → exit_code 0
+          if exit_code == 0: return (combined_output, 0)
+        return (last_output, last_code)
 ```
 
-The `openai/<model>` prefix is litellm's convention for "treat this as an
-OpenAI-API-compatible endpoint." DigitalOcean's Serverless Inference exposes
-the OpenAI Chat Completions schema verbatim, so litellm + aider need no
-DO-specific code path — only env vars and a base URL override.
+There is no litellm, no `--openai-api-base` shell argument, no per-model
+prefix munging. Each daemon is launched with `OPENAI_API_KEY`,
+`OPENAI_BASE_URL`, `OPENAI_MODEL` set in its own process environment, so
+the gRPC client just speaks to whichever port matches the desired
+provider. The legacy `run_aider` symbol is preserved as an alias for
+backwards compatibility with the Hermes/SAST/red-team callers.
 
 ### 2.2 Hermes path — `hermes_orchestrator.py::_hermes_llm_call`
 
