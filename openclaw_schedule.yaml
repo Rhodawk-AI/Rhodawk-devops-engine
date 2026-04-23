@@ -1,0 +1,30 @@
+# Rhodawk EmbodiedOS — heartbeat schedule (Masterplan §6).
+# All cron expressions are UTC unless noted.
+heartbeat:
+  health_check:        every: 15min
+  harvester_run:       cron: "0 */6 * * *"   # every 6 hours
+  night_hunt_start:    cron: "0 23 * * *"    # 11 PM daily
+  morning_report:      cron: "0 6 * * *"     # 6 AM daily
+  lora_export_check:   cron: "0 2 * * 0"     # Sunday 2 AM
+  training_digest:     cron: "0 9 * * 1"     # Monday 9 AM
+
+channels:
+  telegram:
+    enabled: true
+    chat_id_env: TELEGRAM_CHAT_ID
+    bot_token_env: TELEGRAM_BOT_TOKEN
+  discord:
+    enabled: false
+  slack:
+    enabled: false
+
+intents:
+  - scan_repo
+  - night_run_now
+  - pause_night
+  - resume_night
+  - status
+  - approve_finding
+  - reject_finding
+  - explain_finding
+  - help

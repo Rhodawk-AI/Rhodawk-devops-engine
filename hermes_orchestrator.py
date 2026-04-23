@@ -567,8 +567,26 @@ def run_hermes_research(
     log(f"Session {session_id} started → {target_repo}")
     log(f"Model: {HERMES_MODEL} | Max iterations: {max_iterations}")
 
+    # ── Masterplan §5: semantic skill injection ──────────────────────────
+    skill_pack = ""
+    try:
+        from architect import skill_selector  # local import — never fatal
+        skill_pack = skill_selector.select_for_task(
+            task_description=focus_area or f"security audit of {target_repo}",
+            repo_languages=[],            # populated by recon phase later
+            repo_tech_stack=[],
+            attack_phase="static",
+            top_k=5,
+            pin=["vibe-coded-app-hunter", "bb-methodology-claude"],
+        )
+        if skill_pack:
+            log(f"skill_selector loaded {skill_pack.count('<skill ')} skill(s)", "SKILL")
+    except Exception as exc:  # noqa: BLE001
+        log(f"skill_selector unavailable: {exc}", "WARN")
+
+    system_content = (skill_pack + "\n\n" + _HERMES_SYSTEM) if skill_pack else _HERMES_SYSTEM
     messages = [
-        {"role": "system", "content": _HERMES_SYSTEM},
+        {"role": "system", "content": system_content},
         {"role": "user", "content": (
             f"TARGET REPOSITORY: {target_repo}\n"
             f"LOCAL PATH: {repo_dir}\n"

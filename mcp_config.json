@@ -4,7 +4,7 @@
     "Actual runtime config is written to /tmp/mcp_runtime.json at startup.",
     "Secrets injected from HF Space env vars — never committed.",
     "FETCH_ALLOWED_DOMAINS prevents SSRF against internal services.",
-    "Rhodawk AI v5.0 — 25 cybersecurity MCP server suite for OpenClaw Hermes agent."
+    "Rhodawk AI v6.0 — 37 cybersecurity MCP server suite (12 new in v6 per Masterplan §8)."
   ],
   "mcpServers": {
     "fetch-docs": {
@@ -315,7 +315,13 @@
         "-m",
         "mythos.mcp.scope_parser_mcp"
       ],
-      "description": "ARCHITECT: HackerOne / Bugcrowd / Intigriti scope ingestion + raw policy parser"
+      "description": "ARCHITECT: HackerOne / Bugcrowd / Intigriti scope ingestion for night-mode",
+      "env": {
+        "HACKERONE_USERNAME": "__INJECTED_BY_APP_AT_RUNTIME__",
+        "HACKERONE_API_TOKEN": "__INJECTED_BY_APP_AT_RUNTIME__",
+        "BUGCROWD_API_TOKEN": "__INJECTED_BY_APP_AT_RUNTIME__",
+        "INTIGRITI_API_TOKEN": "__INJECTED_BY_APP_AT_RUNTIME__"
+      }
     },
     "subdomain-enum-mcp": {
       "command": "python",
@@ -331,7 +337,7 @@
         "-m",
         "mythos.mcp.httpx_probe_mcp"
       ],
-      "description": "ARCHITECT: concurrent HTTP(S) probing + tech fingerprint"
+      "description": "ARCHITECT: httpx live-host probe + tech fingerprint"
     },
     "shodan-mcp": {
       "command": "python",
@@ -339,7 +345,10 @@
         "-m",
         "mythos.mcp.shodan_mcp"
       ],
-      "description": "ARCHITECT: passive recon via the Shodan REST API"
+      "description": "ARCHITECT: Shodan internet-exposure lookup",
+      "env": {
+        "SHODAN_API_KEY": "__INJECTED_BY_APP_AT_RUNTIME__"
+      }
     },
     "wayback-mcp": {
       "command": "python",
@@ -347,7 +356,7 @@
         "-m",
         "mythos.mcp.wayback_mcp"
       ],
-      "description": "ARCHITECT: Wayback Machine + URLScan historical-URL miner"
+      "description": "ARCHITECT: Wayback / CommonCrawl historical URL recall"
     },
     "frida-runtime-mcp": {
       "command": "python",
@@ -381,54 +390,110 @@
       ],
       "description": "ARCHITECT: GNU Radio / rtl_sdr scripted RF capture & analysis"
     },
-    "scope-parser-mcp": {
+    "skill-selector-mcp": {
       "command": "python",
       "args": [
         "-m",
-        "mythos.mcp.scope_parser_mcp"
+        "mythos.mcp.skill_selector_mcp"
       ],
-      "description": "ARCHITECT: HackerOne / Bugcrowd / Intigriti scope ingestion for night-mode",
+      "description": "Rhodawk: semantic skill selection (MiniLM) — brain extension on demand"
+    },
+    "trufflehog-deep-mcp": {
+      "command": "uvx",
+      "args": [
+        "mcp-server-shell",
+        "--allow-commands",
+        "trufflehog,git"
+      ],
+      "description": "TruffleHog deep scan over full git history (all commit depths)"
+    },
+    "gitleaks-mcp": {
+      "command": "uvx",
+      "args": [
+        "mcp-server-shell",
+        "--allow-commands",
+        "gitleaks,git"
+      ],
+      "description": "Gitleaks — complementary secret scanner with custom rules"
+    },
+    "semgrep-pro-patterns-mcp": {
+      "command": "uvx",
+      "args": [
+        "mcp-server-shell",
+        "--allow-commands",
+        "semgrep"
+      ],
+      "description": "Semgrep with p/security-audit + p/owasp-top-ten + p/cwe-top-25 rulesets",
       "env": {
-        "HACKERONE_USERNAME": "__INJECTED_BY_APP_AT_RUNTIME__",
-        "HACKERONE_API_TOKEN": "__INJECTED_BY_APP_AT_RUNTIME__",
-        "BUGCROWD_API_TOKEN":  "__INJECTED_BY_APP_AT_RUNTIME__",
-        "INTIGRITI_API_TOKEN": "__INJECTED_BY_APP_AT_RUNTIME__"
+        "SEMGREP_RULES": "p/security-audit p/owasp-top-ten p/cwe-top-25 p/r2c-security-audit"
       }
     },
-    "subdomain-enum-mcp": {
+    "jwt-analyzer-mcp": {
       "command": "python",
       "args": [
         "-m",
-        "mythos.mcp.subdomain_enum_mcp"
+        "mythos.mcp.jwt_analyzer_mcp"
       ],
-      "description": "ARCHITECT: subfinder + amass + dnsx + crt.sh subdomain enumeration"
+      "description": "JWT alg:none, weak-secret brute, key confusion, missing exp/nbf"
     },
-    "wayback-mcp": {
-      "command": "python",
+    "api-fuzzer-mcp": {
+      "command": "uvx",
       "args": [
-        "-m",
-        "mythos.mcp.wayback_mcp"
+        "mcp-server-shell",
+        "--allow-commands",
+        "restler,dredd,schemathesis"
       ],
-      "description": "ARCHITECT: Wayback / CommonCrawl historical URL recall"
+      "description": "Stateful REST/GraphQL API fuzzer (RESTler/Dredd/Schemathesis)"
     },
-    "httpx-probe-mcp": {
-      "command": "python",
+    "solidity-auditor-mcp": {
+      "command": "uvx",
       "args": [
-        "-m",
-        "mythos.mcp.httpx_probe_mcp"
+        "mcp-server-shell",
+        "--allow-commands",
+        "slither,myth,solc"
       ],
-      "description": "ARCHITECT: httpx live-host probe + tech fingerprint"
+      "description": "Smart-contract static analysis: Slither + Mythril"
     },
-    "shodan-mcp": {
+    "dependency-confusion-mcp": {
       "command": "python",
       "args": [
         "-m",
-        "mythos.mcp.shodan_mcp"
+        "mythos.mcp.dep_confusion_mcp"
       ],
-      "description": "ARCHITECT: Shodan internet-exposure lookup",
-      "env": {
-        "SHODAN_API_KEY": "__INJECTED_BY_APP_AT_RUNTIME__"
-      }
+      "description": "Detect dependency-confusion vectors (npm + PyPI manifests)"
+    },
+    "git-forensics-deep-mcp": {
+      "command": "uvx",
+      "args": [
+        "mcp-server-shell",
+        "--allow-commands",
+        "git-dumper,git"
+      ],
+      "description": "Exposed .git directories + incomplete .gitignore detection"
+    },
+    "openapi-analyzer-mcp": {
+      "command": "python",
+      "args": [
+        "-m",
+        "mythos.mcp.openapi_analyzer_mcp"
+      ],
+      "description": "Parse OpenAPI/Swagger and enumerate attack surface"
+    },
+    "cors-analyzer-mcp": {
+      "command": "python",
+      "args": [
+        "-m",
+        "mythos.mcp.cors_analyzer_mcp"
+      ],
+      "description": "CORS misconfiguration: origin reflection, null origin, wildcard+credentials"
+    },
+    "prototype-pollution-mcp": {
+      "command": "python",
+      "args": [
+        "-m",
+        "mythos.mcp.prototype_pollution_mcp"
+      ],
+      "description": "JS prototype-pollution sink scanner (AST-style grep)"
     }
   }
 }

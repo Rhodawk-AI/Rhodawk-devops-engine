@@ -2690,4 +2690,25 @@ if __name__ == "__main__":
     except Exception as _e:  # noqa: BLE001
         print(f"[ARCHITECT] night-mode scheduler not started: {_e}")
 
+    # ── Masterplan §3 — Night Hunter orchestrator (opt-in NIGHT_HUNTER=1) ──
+    if os.getenv("NIGHT_HUNTER", "0") == "1":
+        try:
+            import night_hunt_orchestrator as _nh
+            _nh.start_in_background()
+            print("[NIGHT-HUNTER] background scheduler armed")
+        except Exception as _e:  # noqa: BLE001
+            print(f"[NIGHT-HUNTER] scheduler not started: {_e}")
+
+    # ── Masterplan §6 — OpenClaw / EmbodiedOS gateway (opt-in OPENCLAW=1) ──
+    if os.getenv("OPENCLAW", "0") == "1":
+        try:
+            import openclaw_gateway as _oc
+            _oc.start_in_background(
+                host=os.getenv("OPENCLAW_HOST", "0.0.0.0"),
+                port=int(os.getenv("OPENCLAW_PORT", "8765")),
+            )
+            print("[OPENCLAW] gateway listening")
+        except Exception as _e:  # noqa: BLE001
+            print(f"[OPENCLAW] gateway not started: {_e}")
+
     demo.launch(server_name="0.0.0.0", server_port=port, share=False, show_error=True)
