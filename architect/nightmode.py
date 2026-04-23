@@ -123,6 +123,35 @@ class NightRun:
 
 
 def run_one_cycle() -> NightRun:
+    # W-009 FIX: coordinate with night_hunt_orchestrator.py so the two
+    # autonomous bug-bounty loops never run overlapping cycles.
+    import sys, os as _os
+    sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    from night_hunt_lock import try_acquire_night_hunt, release_night_hunt, is_locked
+
+    holder = "architect-nightmode"
+    if not try_acquire_night_hunt(holder):
+        _, other, held_for = is_locked()
+        LOG.warning(
+            "ARCHITECT night-mode cycle skipped — another hunt loop (%s) "
+            "holds the lock for %.0fs already. Set RHODAWK_NIGHT_HUNT_LOCK=false "
+            "to disable this guard.", other, held_for,
+        )
+        embodied_bridge.emit_status(
+            f"Night-mode cycle skipped — lock held by {other}", "warn",
+        )
+        skip = NightRun()
+        skip.summary = {"skipped": True, "lock_holder": other}
+        skip.finished_at = _now()
+        return skip
+
+    try:
+        return _run_one_cycle_inner()
+    finally:
+        release_night_hunt(holder)
+
+
+def _run_one_cycle_inner() -> NightRun:
     run = NightRun()
     embodied_bridge.emit_status("Night-mode cycle started", "info")
 

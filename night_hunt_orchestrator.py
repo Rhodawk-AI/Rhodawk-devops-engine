@@ -452,6 +452,28 @@ def run_night_cycle(
     max_targets: int = MAX_TARGETS,
 ) -> NightCycleReport:
     """Execute one full hunting cycle and return the report."""
+    # W-009 FIX: serialize against architect/nightmode.py so the two
+    # autonomous bug-bounty loops never run overlapping cycles against the
+    # same bounty platform scope.
+    from night_hunt_lock import try_acquire_night_hunt, release_night_hunt, is_locked
+
+    holder = "night-hunt-orchestrator"
+    if not try_acquire_night_hunt(holder):
+        locked, other, held_for = is_locked()
+        LOG.warning(
+            "night cycle skipped — another hunt loop (%s) holds the lock "
+            "for %.0fs already. Set RHODAWK_NIGHT_HUNT_LOCK=false to disable "
+            "this guard.", other, held_for,
+        )
+        skip_report = NightCycleReport(
+            cycle_id=uuid.uuid4().hex[:12],
+            started_at=datetime.now(timezone.utc).isoformat(),
+            platforms=list(platforms or DEFAULT_PLATFORMS),
+        )
+        skip_report.notes.append(f"skipped: night-hunt lock held by {other}")
+        skip_report.finished_at = datetime.now(timezone.utc).isoformat()
+        return skip_report
+
     cycle_id = uuid.uuid4().hex[:12]
     report = NightCycleReport(
         cycle_id=cycle_id,
@@ -471,19 +493,23 @@ def run_night_cycle(
         report.errors.append(f"scope:{exc}")
         return _finalise(report)
 
-    for tgt in report.targets:
-        try:
-            recon = _recon(tgt)
-            findings = _hunt(tgt, recon)
-            findings = _validate(findings)
-            for f in findings:
-                f.draft_submission = _draft_submission(f)
-            report.findings.extend(findings)
-        except Exception as exc:  # noqa: BLE001
-            LOG.exception("target %s crashed: %s", tgt.program, exc)
-            report.errors.append(f"target:{tgt.program}:{exc}")
+    try:
+        for tgt in report.targets:
+            try:
+                recon = _recon(tgt)
+                findings = _hunt(tgt, recon)
+                findings = _validate(findings)
+                for f in findings:
+                    f.draft_submission = _draft_submission(f)
+                report.findings.extend(findings)
+            except Exception as exc:  # noqa: BLE001
+                LOG.exception("target %s crashed: %s", tgt.program, exc)
+                report.errors.append(f"target:{tgt.program}:{exc}")
 
-    return _finalise(report)
+        return _finalise(report)
+    finally:
+        # W-009 FIX: always release the lock so subsequent cycles can run.
+        release_night_hunt(holder)
 
 
 def _finalise(report: NightCycleReport) -> NightCycleReport:

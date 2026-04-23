@@ -44,8 +44,35 @@ def _get_conn():
                 return cur
 
             def executescript(self, script: str):
+                # W-006 FIX: psycopg2's cursor.execute() only processes the
+                # FIRST statement of a multi-statement string. SQLite's
+                # connection.executescript() processes all of them. To match
+                # SQLite semantics, split on `;` and execute statements one at
+                # a time. We respect single/double-quoted string literals so
+                # semicolons inside SQL strings (e.g. defaults) don't break
+                # the split.
                 cur = self.conn.cursor()
-                cur.execute(script)
+                statements: list[str] = []
+                buf: list[str] = []
+                in_squote = False
+                in_dquote = False
+                for ch in script:
+                    if ch == "'" and not in_dquote:
+                        in_squote = not in_squote
+                    elif ch == '"' and not in_squote:
+                        in_dquote = not in_dquote
+                    if ch == ";" and not in_squote and not in_dquote:
+                        stmt = "".join(buf).strip()
+                        if stmt:
+                            statements.append(stmt)
+                        buf = []
+                    else:
+                        buf.append(ch)
+                tail = "".join(buf).strip()
+                if tail:
+                    statements.append(tail)
+                for stmt in statements:
+                    cur.execute(stmt)
                 return cur
 
             def commit(self):

@@ -1969,6 +1969,52 @@ with gr.Blocks(title="Rhodawk AI — Code Review Monster", theme=THEME) as demo:
         # ── TAB 1: LIVE OPERATIONS ──────────────────────────────
         with gr.Tab("⚡ Live Operations"):
 
+            # ── W-005 + W-012 FIX: SYSTEM STATUS BANNER ─────────
+            # Explicitly surface the ENABLED/DISABLED state of every major
+            # opt-in subsystem (Z3, Auto-Merge, Mythos, ARCHITECT, LoRA) so
+            # operators are never misled into thinking a tab implies a live
+            # capability. Renders once at UI build time from env vars.
+            def _flag(name: str, default: str = "false") -> str:
+                v = os.getenv(name, default).lower().strip()
+                on = v in ("1", "true", "yes", "on")
+                return ("✅ ENABLED" if on else "⚠️ DISABLED")
+
+            _z3_state         = _flag("RHODAWK_Z3_ENABLED", "true")  # W-004 default flipped
+            _auto_merge_state = _flag("RHODAWK_AUTO_MERGE", "false")
+            _mythos_state     = _flag("RHODAWK_MYTHOS", "0")
+            _architect_state  = _flag("ARCHITECT_NIGHTMODE", "0")
+            _lora_state       = _flag("RHODAWK_LORA_ENABLED", "false")
+            _hermes_provider  = os.getenv("HERMES_PROVIDER", "auto")  # W-008
+            _night_lock_state = _flag("RHODAWK_NIGHT_HUNT_LOCK", "true")  # W-009
+
+            gr.HTML(f"""
+            <div style="margin:8px 0 16px 0; padding:14px 18px;
+                        background:#0a0f1f; border:1px solid #2d3a5a;
+                        border-left:4px solid #7c3aed; border-radius:10px;
+                        font-family:ui-monospace,Menlo,monospace; font-size:0.82rem;">
+              <div style="font-weight:700; color:#a78bfa; letter-spacing:0.06em;
+                          text-transform:uppercase; margin-bottom:8px;">
+                System Status — Feature Gates
+              </div>
+              <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
+                          gap:6px 18px; color:#cbd5e1;">
+                <div>Z3 Formal Verification: <b>{_z3_state}</b></div>
+                <div>Auto-Merge (Conviction Engine): <b>{_auto_merge_state}</b></div>
+                <div>Mythos Multi-Agent: <b>{_mythos_state}</b></div>
+                <div>ARCHITECT Night-Mode: <b>{_architect_state}</b></div>
+                <div>LoRA Scheduler: <b>{_lora_state}</b></div>
+                <div>Night-Hunt Mutex (W-009): <b>{_night_lock_state}</b></div>
+                <div>Hermes Provider: <b>{_hermes_provider}</b></div>
+              </div>
+              <div style="margin-top:8px; color:#64748b; font-size:0.75rem;">
+                Auto-Merge is OFF by default for safety. Enable with
+                <code style="color:#a78bfa;">RHODAWK_AUTO_MERGE=true</code> only after
+                you trust the conviction engine on your repo. Disabled subsystems
+                show their tab in the UI but do NOT execute at runtime.
+              </div>
+            </div>
+            """)
+
             # ── STATUS BAR ──────────────────────────────────────
             with gr.Row():
                 stat_status = gr.Textbox(label="System Status", interactive=False, scale=3)

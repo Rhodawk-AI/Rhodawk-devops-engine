@@ -22,9 +22,13 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field, asdict
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import requests
+
+# W-010 FIX: rolling 30-day window instead of a hardcoded 2025-01-01 floor.
+HARVESTER_PUSHED_WINDOW_DAYS = int(os.getenv("RHODAWK_HARVESTER_PUSHED_WINDOW_DAYS", "30"))
 
 GITHUB_TOKEN       = os.getenv("GITHUB_TOKEN", "")
 HARVESTER_ENABLED  = os.getenv("RHODAWK_HARVESTER_ENABLED", "false").lower() == "true"
@@ -67,10 +71,14 @@ def _gh_headers() -> dict:
 
 def _search_repos_with_failing_ci(language: str, page: int = 1) -> list[dict]:
     """Search GitHub for repos in a given language with recent activity."""
+    # W-010 FIX: dynamic rolling window — was hardcoded "pushed:>2025-01-01".
+    pushed_floor = (
+        datetime.now(timezone.utc) - timedelta(days=HARVESTER_PUSHED_WINDOW_DAYS)
+    ).strftime("%Y-%m-%d")
     q = (
         f"language:{language} "
         f"stars:>={HARVESTER_MIN_STARS} "
-        f"pushed:>2025-01-01 "
+        f"pushed:>{pushed_floor} "
         f"fork:false "
         f"is:public"
     )

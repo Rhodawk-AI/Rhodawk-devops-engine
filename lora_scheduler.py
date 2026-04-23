@@ -164,6 +164,29 @@ def run_training_export() -> dict:
         for ex in examples:
             f.write(json.dumps(ex) + "\n")
 
+    # W-011 FIX: notify operators (Telegram + Slack) on every successful
+    # LoRA JSONL export so they know fresh training data is ready, instead of
+    # silently accumulating files in /data/lora_exports/ with no consumer.
+    try:
+        import notifier as _notifier  # type: ignore
+        msg = (
+            f"📦 *Rhodawk LoRA Export*\n"
+            f"• Samples: `{len(examples)}`\n"
+            f"• Path: `{out_path}`\n"
+            f"• Timestamp: `{timestamp}`\n"
+            f"Ready for HF PEFT/TRL/AutoTrain consumption."
+        )
+        if hasattr(_notifier, "notify"):
+            _notifier.notify(msg)  # type: ignore[attr-defined]
+        elif hasattr(_notifier, "send_telegram"):
+            _notifier.send_telegram(msg)  # type: ignore[attr-defined]
+        if hasattr(_notifier, "send_slack"):
+            _notifier.send_slack(msg)  # type: ignore[attr-defined]
+    except Exception as _exc:
+        # Notifications are best-effort; never fail the export over a
+        # missing Telegram/Slack credential.
+        print(f"[lora_scheduler] notification dispatch skipped: {_exc}")
+
     state = _load_state()
     try:
         with sqlite3.connect(DB_PATH) as conn:

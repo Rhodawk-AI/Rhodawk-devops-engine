@@ -187,6 +187,20 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
         if path == "/webhook/github":
             sig = self.headers.get("X-Hub-Signature-256", "")
+            # W-007 FIX: distinguish missing-secret config from a bad signature.
+            # When RHODAWK_WEBHOOK_SECRET is unset we now return 403 with an
+            # explicit JSON error body so the operator gets an actionable
+            # response instead of a silent rejection.
+            if not WEBHOOK_SECRET:
+                _log_webhook("github", payload, "REJECTED",
+                             "RHODAWK_WEBHOOK_SECRET not configured on server")
+                self._send_json(403, {
+                    "error": "RHODAWK_WEBHOOK_SECRET not configured on server",
+                    "remediation": "Set the RHODAWK_WEBHOOK_SECRET environment variable "
+                                   "to the same shared secret configured on your GitHub "
+                                   "webhook before sending events.",
+                })
+                return
             if not _verify_github_signature(body, sig):
                 _log_webhook("github", payload, "REJECTED", "Invalid HMAC signature")
                 self._send_json(401, {"error": "Invalid signature"})

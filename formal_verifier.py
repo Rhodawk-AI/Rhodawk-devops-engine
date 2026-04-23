@@ -21,7 +21,11 @@ Enable:  RHODAWK_Z3_ENABLED=true
 import os
 import re
 
-Z3_ENABLED = os.getenv("RHODAWK_Z3_ENABLED", "false").lower() == "true"
+# W-004 FIX: Z3 formal verification gate is now ON by default.
+# z3-solver is already pinned in requirements.txt. Operators may explicitly
+# disable it with RHODAWK_Z3_ENABLED=false. A loud startup warning is emitted
+# whenever Z3 is skipped (either disabled or import failure).
+Z3_ENABLED = os.getenv("RHODAWK_Z3_ENABLED", "true").lower() == "true"
 
 _IMPORT_OK = False
 try:
@@ -29,6 +33,22 @@ try:
     _IMPORT_OK = True
 except ImportError:
     pass
+
+import sys as _sys
+if not Z3_ENABLED:
+    print(
+        "[STARTUP WARNING] Z3 formal verification gate is DISABLED "
+        "(RHODAWK_Z3_ENABLED=false). Step 7b of the healing loop will "
+        "be skipped and no UNSAFE diffs will be blocked by Z3.",
+        file=_sys.stderr,
+    )
+elif not _IMPORT_OK:
+    print(
+        "[STARTUP WARNING] Z3 formal verification gate is ENABLED but "
+        "z3-solver is not installed. Run: pip install z3-solver. "
+        "Step 7b of the healing loop will return SKIP.",
+        file=_sys.stderr,
+    )
 
 
 def _extract_added_lines(diff_text: str) -> list[str]:

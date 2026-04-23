@@ -44,6 +44,19 @@ HERMES_MODEL       = os.getenv("HERMES_MODEL", "deepseek/deepseek-r1:free")
 HERMES_FAST_MODEL  = os.getenv("HERMES_FAST_MODEL", "deepseek/deepseek-v3:free")
 OPENROUTER_BASE    = "https://openrouter.ai/api/v1"
 
+# W-008 FIX: explicit provider routing flag so the operator can force Hermes
+# through the OpenClaude gRPC daemon (which itself fails over DO → OpenRouter
+# inside the daemon process). Without this flag, Hermes was bypassing the
+# OpenClaude daemon entirely, breaking cost attribution and rate-limit
+# budgeting.
+#
+# Allowed values:
+#   "auto"            — try DO Inference REST then OpenRouter REST (legacy)
+#   "openclaude_grpc" — route through openclaude_grpc.client (DO daemon :50051)
+#   "do"              — DO Inference REST only
+#   "openrouter"      — OpenRouter REST only
+HERMES_PROVIDER = os.getenv("HERMES_PROVIDER", "auto").lower().strip()
+
 # ── DigitalOcean Serverless Inference (PRIMARY provider) ────────────────
 # OpenAI-compatible REST API. We POST to /chat/completions just like
 # OpenRouter; only the base URL, auth header, and model name differ.
@@ -467,11 +480,38 @@ def _hermes_llm_call(messages: list[dict], model: str = None, timeout: int = 120
       2. On any non-recoverable failure or exhausted rate-limit retries,
          fall back to OpenRouter (OPENROUTER_API_KEY).
       3. If neither is configured, return a graceful no-op.
+
+    W-008 FIX: respect HERMES_PROVIDER env var. When set to
+    "openclaude_grpc" all calls are routed through the OpenClaude gRPC
+    daemon (DigitalOcean primary on :50051, OpenRouter fallback on :50052)
+    instead of bypassing the daemon with direct REST calls.
     """
     requested_model = model or HERMES_MODEL
 
+    # W-008 FIX: openclaude_grpc routing path.
+    if HERMES_PROVIDER == "openclaude_grpc":
+        try:
+            from openclaude_grpc.client import OpenClaudeClient
+            hermes_log("LLM call → openclaude_grpc daemon (:50051)", "HERMES")
+            prompt_text = "\n\n".join(
+                f"[{m.get('role', 'user').upper()}] {m.get('content', '')}"
+                for m in messages
+            )
+            client = OpenClaudeClient(host="127.0.0.1", port=50051)
+            combined, exit_code = client.chat(prompt_text, timeout=timeout)
+            try:
+                return json.loads(combined)
+            except (json.JSONDecodeError, TypeError):
+                return {"done": exit_code == 0, "summary": combined}
+        except Exception as exc:
+            hermes_log(f"openclaude_grpc routing failed: {exc} — falling back to REST",
+                       "WARN")
+            # Fall through to REST providers below.
+
     providers: list[tuple[str, str, str, str, dict]] = []
-    if DO_INFERENCE_API_KEY:
+    do_allowed = HERMES_PROVIDER in ("auto", "do", "openclaude_grpc")
+    or_allowed = HERMES_PROVIDER in ("auto", "openrouter", "openclaude_grpc")
+    if do_allowed and DO_INFERENCE_API_KEY:
         do_model = (
             _strip_provider_prefix(requested_model)
             if requested_model.startswith(("openai/",))
@@ -480,7 +520,7 @@ def _hermes_llm_call(messages: list[dict], model: str = None, timeout: int = 120
         providers.append(
             ("DigitalOcean", DO_INFERENCE_BASE, DO_INFERENCE_API_KEY, do_model, {})
         )
-    if OPENROUTER_API_KEY:
+    if or_allowed and OPENROUTER_API_KEY:
         or_model = _strip_provider_prefix(requested_model) if "/" in requested_model else requested_model
         # OpenRouter expects models in `vendor/name` form — only re-add the
         # prefix when the caller passed an `openai/...` (DO-shaped) string.
