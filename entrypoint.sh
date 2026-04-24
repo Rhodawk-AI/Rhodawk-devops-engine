@@ -110,5 +110,12 @@ else
     echo "[entrypoint] META_LEARNER_ENABLED=0 — skipping meta-learner daemon"
 fi
 
-echo "[entrypoint] launching Rhodawk orchestrator…"
+# EmbodiedOS = Hermes + OpenClaw unified front-of-house.  app.py already
+# wires the OpenClaw HTTP gateway behind OPENCLAW=1; we default it ON so
+# the unified NL command surface (POST /openclaw/command + Telegram
+# webhook + the new mission_repo / mission_bounty intents registered by
+# embodied_os.py) is live as soon as the container is up.
+export OPENCLAW="${OPENCLAW:-1}"
+
+echo "[entrypoint] launching Rhodawk orchestrator (EmbodiedOS=on)…"
 exec python -u app.py

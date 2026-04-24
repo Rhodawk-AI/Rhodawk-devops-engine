@@ -2599,6 +2599,20 @@ After approval, you can submit to HackerOne or create a GitHub Security Advisory
                         interactive=False,
                     )
 
+        # ── EmbodiedOS — unified Hermes + OpenClaw front-of-house ───
+        # Mounted last so it never shadows or alters any pre-existing
+        # tab.  Wrapped in try/except so any import / render failure
+        # in the new module leaves the rest of the UI untouched.
+        try:
+            with gr.Tab("🧬 EmbodiedOS"):
+                from embodied_os_ui import build_embodied_os_tab as _build_eos
+                _build_eos()
+        except Exception as _eos_exc:  # noqa: BLE001
+            with gr.Tab("🧬 EmbodiedOS (degraded)"):
+                gr.Markdown(
+                    f"### EmbodiedOS failed to mount\n\n```\n{_eos_exc}\n```"
+                )
+
     # ── AUTO-REFRESH ────────────────────────────────────────────
     # FIX (Timer Bug): Single tick replaces 3 concurrent SSE streams.
     # get_combined_refresh() returns all 8 outputs at once, using one connection
