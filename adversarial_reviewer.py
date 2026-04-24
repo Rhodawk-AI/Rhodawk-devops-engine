@@ -18,14 +18,33 @@ import time
 import requests
 from requests.exceptions import HTTPError
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_API_KEY    = os.getenv("OPENROUTER_API_KEY", "")
+DO_INFERENCE_API_KEY  = os.getenv("DO_INFERENCE_API_KEY", "") or os.getenv(
+    "DIGITALOCEAN_INFERENCE_KEY", "")
+DO_INFERENCE_BASE_URL = os.getenv(
+    "DO_INFERENCE_BASE_URL", "https://inference.do-ai.run/v1").rstrip("/")
+OPENROUTER_BASE_URL   = os.getenv(
+    "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
 
-ADVERSARY_MODEL_PRIMARY = os.getenv(
-    "RHODAWK_ADVERSARY_MODEL",
-    "deepseek/deepseek-r1:free"
-)
-ADVERSARY_MODEL_SECONDARY = "meta-llama/llama-3.3-70b-instruct:free"
-ADVERSARY_MODEL_TERTIARY  = "google/gemma-3-27b-it:free"
+# 3-model adversarial squad. DigitalOcean catalog ids are PRIMARY (used when
+# DO_INFERENCE_API_KEY is set); OpenRouter ids are the FALLBACK pairings.
+# Override per-slot with the matching env var.
+ADVERSARY_MODEL_PRIMARY   = os.getenv("RHODAWK_ADVERSARY_MODEL",
+                                      "deepseek-r1-distill-llama-70b")
+ADVERSARY_MODEL_SECONDARY = os.getenv("RHODAWK_ADVERSARY_MODEL_2",
+                                      "llama-3.3-70b-instruct")
+ADVERSARY_MODEL_TERTIARY  = os.getenv("RHODAWK_ADVERSARY_MODEL_3",
+                                      "qwen3-32b")
+
+# OpenRouter shapes for the same three slots, used only on fallback.
+_OR_FALLBACK_FOR: dict[str, str] = {
+    ADVERSARY_MODEL_PRIMARY:   os.getenv(
+        "RHODAWK_ADVERSARY_MODEL_OR",   "deepseek/deepseek-r1-distill-llama-70b"),
+    ADVERSARY_MODEL_SECONDARY: os.getenv(
+        "RHODAWK_ADVERSARY_MODEL_2_OR", "meta-llama/llama-3.3-70b-instruct"),
+    ADVERSARY_MODEL_TERTIARY:  os.getenv(
+        "RHODAWK_ADVERSARY_MODEL_3_OR", "qwen/qwen3-32b"),
+}
 
 _MODEL_CHAIN = [
     ADVERSARY_MODEL_PRIMARY,
@@ -67,15 +86,16 @@ verdict rules:
 """
 
 
-def _call_openrouter(model: str, system: str, user: str, timeout: int = 60) -> dict:
+def _post_chat(base_url: str, api_key: str, model: str, system: str, user: str,
+               timeout: int = 60, extra_headers: dict | None = None) -> dict:
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "HTTP-Referer": "https://rhodawk.ai",
-        "X-Title": "Rhodawk AI Adversarial Reviewer",
     }
+    if extra_headers:
+        headers.update(extra_headers)
     payload = {
-        "model": model.replace("openrouter/", ""),
+        "model": model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -85,7 +105,7 @@ def _call_openrouter(model: str, system: str, user: str, timeout: int = 60) -> d
         "response_format": {"type": "json_object"},
     }
     resp = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
+        f"{base_url}/chat/completions",
         headers=headers,
         json=payload,
         timeout=timeout,
@@ -96,10 +116,44 @@ def _call_openrouter(model: str, system: str, user: str, timeout: int = 60) -> d
     return json.loads(content)
 
 
+def _call_with_failover(model: str, system: str, user: str, timeout: int = 60) -> dict:
+    """DO-primary, OpenRouter-fallback dispatch for one model slot."""
+    last: Exception | None = None
+    if DO_INFERENCE_API_KEY:
+        try:
+            return _post_chat(
+                DO_INFERENCE_BASE_URL, DO_INFERENCE_API_KEY,
+                model, system, user, timeout,
+            )
+        except HTTPError as e:
+            status = e.response.status_code if e.response is not None else 0
+            if status == 429:
+                time.sleep(_RATE_LIMIT_WAIT)
+            last = e
+        except Exception as e:  # noqa: BLE001 — fall over to OR
+            last = e
+    if OPENROUTER_API_KEY:
+        or_model = _OR_FALLBACK_FOR.get(model, model.replace("openrouter/", ""))
+        return _post_chat(
+            OPENROUTER_BASE_URL, OPENROUTER_API_KEY,
+            or_model, system, user, timeout,
+            extra_headers={
+                "HTTP-Referer": "https://rhodawk.ai",
+                "X-Title": "Rhodawk AI Adversarial Reviewer",
+            },
+        )
+    if last is not None:
+        raise last
+    raise RuntimeError(
+        "Adversarial reviewer cannot run: neither DO_INFERENCE_API_KEY "
+        "nor OPENROUTER_API_KEY is set."
+    )
+
+
 def _call_single_model(model: str, user_prompt: str) -> tuple[dict | None, str]:
     """Call one model; return (result_dict, model_name) or (None, model_name) on failure."""
     try:
-        result = _call_openrouter(model, ADVERSARY_SYSTEM_PROMPT, user_prompt)
+        result = _call_with_failover(model, ADVERSARY_SYSTEM_PROMPT, user_prompt)
         return result, model
     except HTTPError as e:
         status = e.response.status_code if e.response is not None else 0

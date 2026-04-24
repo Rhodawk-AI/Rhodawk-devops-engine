@@ -40,9 +40,12 @@ from typing import Any, Callable, Optional
 import requests
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-HERMES_MODEL       = os.getenv("HERMES_MODEL", "deepseek/deepseek-r1:free")
-HERMES_FAST_MODEL  = os.getenv("HERMES_FAST_MODEL", "deepseek/deepseek-v3:free")
-OPENROUTER_BASE    = "https://openrouter.ai/api/v1"
+# Default Hermes model is now the DigitalOcean model id (DO is PRIMARY).
+# When the request is routed to OpenRouter, hermes_orchestrator transparently
+# rewrites this to the OR-shaped id from model_squad.
+HERMES_MODEL       = os.getenv("HERMES_MODEL", "deepseek-r1-distill-llama-70b")
+HERMES_FAST_MODEL  = os.getenv("HERMES_FAST_MODEL", "qwen3-32b")
+OPENROUTER_BASE    = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
 
 # W-008 FIX: explicit provider routing flag so the operator can force Hermes
 # through the OpenClaude gRPC daemon (which itself fails over DO → OpenRouter
@@ -64,7 +67,7 @@ DO_INFERENCE_API_KEY = os.getenv("DO_INFERENCE_API_KEY", "") or os.getenv("DIGIT
 DO_INFERENCE_BASE    = os.getenv("DO_INFERENCE_BASE_URL", "https://inference.do-ai.run/v1").rstrip("/")
 # Default DO model used when the caller hands us an `openrouter/...` model
 # string (which won't exist on DO). Override with HERMES_DO_MODEL.
-DO_HERMES_MODEL      = os.getenv("HERMES_DO_MODEL", "llama3.3-70b-instruct")
+DO_HERMES_MODEL      = os.getenv("HERMES_DO_MODEL", "deepseek-r1-distill-llama-70b")
 
 _log_lock = threading.Lock()
 

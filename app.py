@@ -122,7 +122,7 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 # Get an API key from: https://cloud.digitalocean.com/gen-ai/agents (Inference)
 DO_INFERENCE_API_KEY = os.getenv("DO_INFERENCE_API_KEY") or os.getenv("DIGITALOCEAN_INFERENCE_KEY")
 DO_INFERENCE_BASE_URL = os.getenv("DO_INFERENCE_BASE_URL", "https://inference.do-ai.run/v1").rstrip("/")
-DO_INFERENCE_MODEL = os.getenv("DO_INFERENCE_MODEL", "llama3.3-70b-instruct")
+DO_INFERENCE_MODEL = os.getenv("DO_INFERENCE_MODEL", "llama-3.3-70b-instruct")
 
 TENANT_ID = os.getenv("RHODAWK_TENANT_ID", "default")
 # Default Aider model — DO inference primary, OpenRouter fallback.
@@ -130,13 +130,13 @@ TENANT_ID = os.getenv("RHODAWK_TENANT_ID", "default")
 # pointed at DigitalOcean. Otherwise we fall back to the OpenRouter model.
 _DEFAULT_AIDER_MODEL = (
     f"openai/{DO_INFERENCE_MODEL}" if DO_INFERENCE_API_KEY
-    else "openrouter/qwen/qwen-2.5-coder-32b-instruct:free"
+    else "openrouter/meta-llama/llama-3.3-70b-instruct"
 )
 MODEL = os.getenv("RHODAWK_MODEL", _DEFAULT_AIDER_MODEL)
 # Explicit fallback model (always OpenRouter) — used if DO inference fails.
 FALLBACK_MODEL = os.getenv(
     "RHODAWK_FALLBACK_MODEL",
-    "openrouter/qwen/qwen-2.5-coder-32b-instruct:free",
+    "openrouter/meta-llama/llama-3.3-70b-instruct",
 )
 RED_TEAM_ENABLED = os.getenv("RHODAWK_RED_TEAM_ENABLED", "true").lower() != "false"
 PAID_API_KEY_WARNING = (
@@ -145,14 +145,20 @@ PAID_API_KEY_WARNING = (
     "high context windows."
 )
 
-# Only GITHUB_TOKEN and OPENROUTER_API_KEY are truly required at startup.
-# GITHUB_REPO is now optional — it can be supplied via the chat inbox at runtime.
-for _key, _val in [("GITHUB_TOKEN", GITHUB_TOKEN), ("OPENROUTER_API_KEY", OPENROUTER_API_KEY)]:
-    if not _val:
-        raise EnvironmentError(
-            f"Required secret '{_key}' is not set. "
-            "Add it in HuggingFace Space Settings → Secrets."
-        )
+# Only GITHUB_TOKEN and one inference key (DO PRIMARY, OpenRouter FALLBACK)
+# are truly required at startup. GITHUB_REPO is optional — it can be supplied
+# via the chat inbox at runtime.
+if not GITHUB_TOKEN:
+    raise EnvironmentError(
+        "Required secret 'GITHUB_TOKEN' is not set. "
+        "Add it in your environment (or HuggingFace Space Settings → Secrets)."
+    )
+if not (DO_INFERENCE_API_KEY or OPENROUTER_API_KEY):
+    raise EnvironmentError(
+        "No inference provider key found. Set 'DO_INFERENCE_API_KEY' "
+        "(DigitalOcean Serverless Inference — PRIMARY) and/or "
+        "'OPENROUTER_API_KEY' (OpenRouter — FALLBACK)."
+    )
 
 # ──────────────────────────────────────────────────────────────
 # PATHS & CONSTANTS

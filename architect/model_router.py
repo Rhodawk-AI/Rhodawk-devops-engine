@@ -37,12 +37,14 @@ from typing import Any
 LOG = logging.getLogger("architect.model_router")
 
 # ── Tier table (Masterplan §1.1) ────────────────────────────────────────────
-TIER1_PRIMARY = os.getenv("TIER1_PRIMARY_MODEL", "minimax/minimax-m2.5-highspeed")
-TIER1_DEEP    = os.getenv("TIER1_DEEP_MODEL",    "deepseek/deepseek-chat-v3")
-TIER2_PRIMARY = os.getenv("TIER2_PRIMARY_MODEL", "qwen/qwen3-235b-a22b")
-TIER3_PRIMARY = os.getenv("TIER3_PRIMARY_MODEL", "minimax/minimax-m2.5")
-TIER4_PRIMARY = os.getenv("TIER4_PRIMARY_MODEL", "anthropic/claude-sonnet-4-6")
-TIER5_LOCAL   = os.getenv("TIER5_LOCAL_MODEL",   "local/deepseek-r1-32b-awq")
+# Defaults follow the Model Squad: cheap DO catalog ids first, OR-only
+# emergency models on the higher tiers. Override any of these via env.
+TIER1_PRIMARY = os.getenv("TIER1_PRIMARY_MODEL", "qwen3-32b")                  # TRIAGE
+TIER1_DEEP    = os.getenv("TIER1_DEEP_MODEL",    "llama-3.3-70b-instruct")     # EXECUTION
+TIER2_PRIMARY = os.getenv("TIER2_PRIMARY_MODEL", "deepseek-r1-distill-llama-70b")  # HERMES
+TIER3_PRIMARY = os.getenv("TIER3_PRIMARY_MODEL", "kimi-k2.5")                  # RECON (OR-only)
+TIER4_PRIMARY = os.getenv("TIER4_PRIMARY_MODEL", "claude-4.6-sonnet")          # FALLBACK (OR-only)
+TIER5_LOCAL   = os.getenv("TIER5_LOCAL_MODEL",   "minimax-m2.5")               # FALLBACK_ALT (OR-only)
 
 # Per-task → preferred model, with overflow chain.
 TASK_ROUTES: dict[str, list[str]] = {

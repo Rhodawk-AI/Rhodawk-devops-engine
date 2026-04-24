@@ -357,9 +357,14 @@ Each training cycle makes the model progressively better at fixing failures in y
 <td>Personal Access Token with <code>repo</code> + <code>security_events</code> scopes. Used to clone repos, open PRs, and create GitHub Security Advisories. <a href="https://github.com/settings/tokens">Create one here.</a></td>
 </tr>
 <tr>
+<td><code>DO_INFERENCE_API_KEY</code></td>
+<td align="center">✅ Primary</td>
+<td><b>The PRIMARY brain.</b> All LLM calls try DigitalOcean Serverless Inference first via <a href="https://inference.do-ai.run/v1"><code>inference.do-ai.run/v1</code></a>. Get a key at <a href="https://cloud.digitalocean.com/gen-ai/agents">cloud.digitalocean.com/gen-ai/agents</a> → Inference → API Keys.</td>
+</tr>
+<tr>
 <td><code>OPENROUTER_API_KEY</code></td>
-<td align="center">✅ Yes</td>
-<td>All LLM calls route through OpenRouter. Default models are on the free tier — you can run this system at zero LLM cost. <a href="https://openrouter.ai/keys">Get a key here.</a></td>
+<td align="center">⬜ Fallback</td>
+<td><b>The FALLBACK brain.</b> Catches every DO failure and unlocks the OR-only members of the Model Squad (<code>kimi-k2.5</code>, <code>claude-4.6-sonnet</code>, <code>minimax-m2.5</code>). <a href="https://openrouter.ai/keys">Get a key here.</a></td>
 </tr>
 <tr>
 <td><code>GITHUB_REPO</code></td>
@@ -437,7 +442,8 @@ npm install -g \
 
 ```bash
 export GITHUB_TOKEN="ghp_your_token_here"
-export OPENROUTER_API_KEY="sk-or-your_key_here"
+export DO_INFERENCE_API_KEY="do_infer_your_key_here"   # PRIMARY brain
+export OPENROUTER_API_KEY="sk-or-your_key_here"        # optional FALLBACK
 export GITHUB_REPO="owner/repo"      # optional — can set in UI
 mkdir -p /data
 ```
@@ -469,10 +475,13 @@ docker run -d \
   -p 7861:7861 \
   -v rhodawk_data:/data \
   -e GITHUB_TOKEN="ghp_your_token_here" \
+  -e DO_INFERENCE_API_KEY="do_infer_your_key_here" \
   -e OPENROUTER_API_KEY="sk-or-your_key_here" \
   -e GITHUB_REPO="owner/target-repo" \
   rhodawk-ai
 ```
+
+> 📘 **Full VPS deployment** (firewall, Caddy + HTTPS, day-2 ops, troubleshooting): see [`DEPLOY_VPS.md`](DEPLOY_VPS.md). Or just run [`install.sh`](install.sh) on a fresh Ubuntu/Debian box.
 
 <hr/>
 
@@ -486,8 +495,9 @@ docker run -d \
 1. Go to:  huggingface.co/spaces/Architect8999/rhodawk-ai-devops-engine
 2. Duplicate the Space (top-right button)
 3. Add Secrets in Space Settings:
-      GITHUB_TOKEN  →  your GitHub PAT
-      OPENROUTER_API_KEY  →  your OpenRouter key
+      GITHUB_TOKEN          →  your GitHub PAT
+      DO_INFERENCE_API_KEY  →  your DigitalOcean Inference key  (PRIMARY)
+      OPENROUTER_API_KEY    →  your OpenRouter key              (FALLBACK, optional)
 4. The Space builds and runs automatically via the included Dockerfile
 ```
 
@@ -627,16 +637,18 @@ rhodawk-devops-engine/
 
 </div>
 
-All default models are on OpenRouter's free tier. This system runs at zero LLM cost out of the box.
+DigitalOcean Serverless Inference is the **PRIMARY** lane; OpenRouter is the **FALLBACK**. The router (`llm_router.py`) tries DO first for every call and silently fails over to OR on any error. The five-role Model Squad is defined in `model_squad.py`.
 
-| Role | Default Model | Override Variable |
-|---|---|---|
-| Code Fix Generation | `qwen/qwen-2.5-coder-32b-instruct:free` | `RHODAWK_MODEL` |
-| Hermes Orchestrator | `deepseek/deepseek-r1:free` | `HERMES_MODEL` |
-| Hermes Fast Tasks | `deepseek/deepseek-v3:free` | `HERMES_FAST_MODEL` |
-| Adversarial Review #1 | `deepseek/deepseek-r1:free` | `RHODAWK_ADVERSARY_MODEL` |
-| Adversarial Review #2 | `meta-llama/llama-3.3-70b-instruct:free` | hardcoded fallback |
-| Adversarial Review #3 | `google/gemma-3-27b-it:free` | hardcoded fallback |
+| Role | Default Model (DO PRIMARY) | OpenRouter Fallback | Override Variable |
+|---|---|---|---|
+| **EXECUTION** — patches / fix-mode / Aider | `llama-3.3-70b-instruct` | `meta-llama/llama-3.3-70b-instruct` | `EXECUTION_MODEL` |
+| **HERMES** — autonomous research loop | `deepseek-r1-distill-llama-70b` | `deepseek/deepseek-r1-distill-llama-70b` | `HERMES_MODEL` |
+| **RECON** — massive-context ingestion *(OR-only)* | `kimi-k2.5` | `moonshotai/kimi-k2.5` | `RECON_MODEL` |
+| **TRIAGE** — fast cheap filtering | `qwen3-32b` | `qwen/qwen3-32b` | `TRIAGE_MODEL` |
+| **FALLBACK** — emergency tier *(OR-only)* | `claude-4.6-sonnet` | `anthropic/claude-sonnet-4.6` | `FALLBACK_MODEL` |
+| **FALLBACK_ALT** — secondary safety net *(OR-only)* | `minimax-m2.5` | `minimax/minimax-m2.5` | `FALLBACK_MODEL_ALT` |
+
+The 3-model adversarial reviewer uses `deepseek-r1-distill-llama-70b`, `llama-3.3-70b-instruct`, and `qwen3-32b` (all on DO; all fall over to their OR equivalents on failure). Override per-slot with `RHODAWK_ADVERSARY_MODEL`, `RHODAWK_ADVERSARY_MODEL_2`, `RHODAWK_ADVERSARY_MODEL_3`.
 
 <hr/>
 

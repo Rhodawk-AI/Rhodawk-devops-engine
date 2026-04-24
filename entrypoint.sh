@@ -74,16 +74,30 @@ start_daemon() {
 # camofox first — slowest to bind because of the lazy engine download.
 start_camofox
 
-# DigitalOcean Inference (PRIMARY)
+# ─── THE MODEL SQUAD (DigitalOcean primary, OpenRouter fallback) ─────
+# 1. The Hands       (EXECUTION) — primary executor / patch generation
+# 2. The Brain       (HERMES)    — reasoning + Godmode meta-learning
+# 3. The Reader      (RECON)     — massive context ingestion (OR-only today)
+# 4. The Screener    (TRIAGE)    — fast cheap filtering
+# 5. The Safety Net  (FALLBACK)  — emergency tier (OR-only)
+# Override any of these via the container env to swap models.
+export EXECUTION_MODEL="${EXECUTION_MODEL:-llama-3.3-70b-instruct}"
+export HERMES_MODEL="${HERMES_MODEL:-deepseek-r1-distill-llama-70b}"
+export RECON_MODEL="${RECON_MODEL:-kimi-k2.5}"
+export TRIAGE_MODEL="${TRIAGE_MODEL:-qwen3-32b}"
+export FALLBACK_MODEL="${FALLBACK_MODEL:-claude-4.6-sonnet}"
+export FALLBACK_MODEL_ALT="${FALLBACK_MODEL_ALT:-minimax-m2.5}"
+
+# DigitalOcean Inference (PRIMARY) — drives the OpenClaude :50051 daemon
 DO_BASE="${DO_INFERENCE_BASE_URL:-https://inference.do-ai.run/v1}"
-DO_MODEL="${DO_INFERENCE_MODEL:-llama3.3-70b-instruct}"
+DO_MODEL="${DO_INFERENCE_MODEL:-${EXECUTION_MODEL}}"
 start_daemon "do" 50051 "${DO_BASE}" \
     "${DO_INFERENCE_API_KEY:-${DIGITALOCEAN_INFERENCE_KEY:-}}" \
     "${DO_MODEL}"
 
-# OpenRouter (FALLBACK)
+# OpenRouter (FALLBACK) — drives the OpenClaude :50052 daemon (optional)
 OR_BASE="${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}"
-OR_MODEL="${OPENROUTER_MODEL:-qwen/qwen-2.5-coder-32b-instruct:free}"
+OR_MODEL="${OPENROUTER_MODEL:-meta-llama/llama-3.3-70b-instruct}"
 start_daemon "or" 50052 "${OR_BASE}" "${OPENROUTER_API_KEY:-}" "${OR_MODEL}"
 
 # Brief settle window so the first healing call doesn't race the binder.

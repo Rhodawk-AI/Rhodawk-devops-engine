@@ -42,28 +42,38 @@ This is the most misunderstood part of the system. Read it twice.
 
 | Variable | Where it is read | What it powers |
 |---|---|---|
-| `DO_INFERENCE_API_KEY` (or alias `DIGITALOCEAN_INFERENCE_KEY`) | `entrypoint.sh`, `app.py`, `hermes_orchestrator.py` | The **PRIMARY** brain. Boots the OpenClaude gRPC daemon on `:50051` against `DO_INFERENCE_BASE_URL` (default `https://inference.do-ai.run/v1`). Default model `llama3.3-70b-instruct`. Hermes also calls this directly when `HERMES_PROVIDER=do` or `auto`. |
-| `OPENROUTER_API_KEY` | `entrypoint.sh`, `app.py`, `hermes_orchestrator.py`, `adversarial_reviewer.py`, `mythos/agents/base.py` | The **FALLBACK** brain *and* the universal brain. Boots the OpenClaude gRPC daemon on `:50052` against `OPENROUTER_BASE_URL`. Default model `qwen/qwen-2.5-coder-32b-instruct:free`. Also drives the 3-model adversarial consensus (DeepSeek-R1, Llama-3.3-70B, Gemma-3-27B — all OpenRouter), the Hermes REST path, and the entire Mythos multi-agent layer. |
-| `GITHUB_TOKEN` | `app.py`, `repo_harvester.py`, `bounty_gateway.py`, `github_app.py` | Not an LLM key. Required for repo cloning, PR creation, GitHub Security Advisory submission. Scopes needed: `repo`, `security_events`. |
+| `DO_INFERENCE_API_KEY` (or alias `DIGITALOCEAN_INFERENCE_KEY`) | `entrypoint.sh`, `app.py`, `hermes_orchestrator.py`, `adversarial_reviewer.py`, `mythos/agents/base.py`, `architect/model_router.py`, `llm_router.py` | The **PRIMARY** brain — used by every LLM-bound subsystem. Boots the OpenClaude gRPC daemon on `:50051` against `DO_INFERENCE_BASE_URL` (default `https://inference.do-ai.run/v1`). Default model is `${EXECUTION_MODEL}` = `llama-3.3-70b-instruct`. Adversarial reviewer, Mythos agents, and Hermes all try DigitalOcean first via `llm_router.py`. |
+| `OPENROUTER_API_KEY` | Same files as above | The **FALLBACK** brain. Boots the OpenClaude gRPC daemon on `:50052` against `OPENROUTER_BASE_URL`. Default model `meta-llama/llama-3.3-70b-instruct`. Catches every DO failure (HTTP error, rate-limit, 5xx) *and* is the only path for the OR-only members of the squad — `kimi-k2.5`, `claude-4.6-sonnet`, `minimax-m2.5`. |
+| `GITHUB_TOKEN` | `app.py`, `repo_harvester.py`, `bounty_gateway.py`, `github_app.py` | Not an LLM key. Required for repo cloning, PR creation, GitHub Security Advisory submission. Scopes: `repo`, `security_events`. |
 | Optional bounty/intel keys | Various | `HACKERONE_API_KEY`, `HACKERONE_USERNAME`, `BUGCROWD_API_KEY`, `NVD_API_KEY`, `BRAVE_API_KEY`, `SEMGREP_APP_TOKEN`, `NUCLEI_API_KEY`, `SHODAN_API_KEY`, `URLSCAN_API_KEY`. Each unlocks one specific data source; all degrade silently when missing. |
 
-### Does one key act as the brain for every detachable component?
+### The Model Squad — five named roles, one router
 
-**Yes — `OPENROUTER_API_KEY` is the universal brain key.** Confirmed from the source:
+`model_squad.py` defines the canonical roster. Every other LLM call site (Hermes, OSS Guardian, Mythos, Architect, Adversarial Reviewer) resolves a role to a concrete model id through `llm_router.py`, which always tries DigitalOcean first and falls over to OpenRouter on any failure.
 
-- `entrypoint.sh` will start the OpenRouter OpenClaude daemon on `:50052` whenever `OPENROUTER_API_KEY` is present, and skip the DigitalOcean daemon on `:50051` when `DO_INFERENCE_API_KEY` is absent (the script literally logs `"skipping ${label} daemon — no API key"`).
-- `hermes_orchestrator.py` builds its provider list dynamically: it appends DigitalOcean only if `DO_INFERENCE_API_KEY` is set, and OpenRouter only if `OPENROUTER_API_KEY` is set. With only OpenRouter present, it routes everything to OpenRouter.
-- `adversarial_reviewer.py` reads only `OPENROUTER_API_KEY` and runs three models concurrently against the OpenRouter API.
-- `mythos/agents/base.py` reads only `OPENROUTER_API_KEY` for the multi-agent orchestrator.
+| Role | Env var | DigitalOcean id (PRIMARY) | OpenRouter id (FALLBACK) | On DO? |
+|---|---|---|---|---|
+| **EXECUTION** — "The Hands" — patch generation, fix-mode, default Aider model | `EXECUTION_MODEL` | `llama-3.3-70b-instruct` | `meta-llama/llama-3.3-70b-instruct` | ✅ |
+| **HERMES** — "The Brain" — autonomous research loop, Godmode meta-learning | `HERMES_MODEL` | `deepseek-r1-distill-llama-70b` | `deepseek/deepseek-r1-distill-llama-70b` | ✅ |
+| **RECON** — "The Reader" — massive-context ingestion (CVE feeds, full repos) | `RECON_MODEL` | `kimi-k2.5` *(not on DO — auto-falls to OR)* | `moonshotai/kimi-k2.5` | ❌ |
+| **TRIAGE** — "The Screener" — fast cheap filtering, T1 routes | `TRIAGE_MODEL` | `qwen3-32b` | `qwen/qwen3-32b` | ✅ |
+| **FALLBACK** — "The Safety Net" — emergency tier when everything else fails | `FALLBACK_MODEL` | `claude-4.6-sonnet` *(OR-only)* | `anthropic/claude-sonnet-4.6` | ❌ |
+| **FALLBACK_ALT** — secondary safety net | `FALLBACK_MODEL_ALT` | `minimax-m2.5` *(OR-only)* | `minimax/minimax-m2.5` | ❌ |
 
-So the practical rule is:
+Routing rule (encoded in `llm_router.chat`):
+
+1. If `DO_INFERENCE_API_KEY` is set **and** the role is `on_do=True`, POST `${DO_INFERENCE_BASE_URL}/chat/completions` with the DO catalog id.
+2. On any 4xx/5xx/timeout, or whenever the role is OR-only, POST `${OPENROUTER_BASE_URL}/chat/completions` with the OR vendor-prefixed id.
+3. Exponential backoff (1s, 2s, 4s) up to `LLM_ROUTER_MAX_RETRIES` (default 3) per leg.
+
+So the practical rule is now:
 
 | Keys you provide | What works |
 |---|---|
-| `OPENROUTER_API_KEY` only | Everything LLM-driven works. The system runs at full feature coverage on the slower (free-tier) lane. |
-| `DO_INFERENCE_API_KEY` only | The OpenClaude DO daemon and Hermes (DO path) work. The 3-model adversarial reviewer and Mythos agents do **not** activate because they hard-read `OPENROUTER_API_KEY`. |
-| Both | Optimal. DO is the fast paid lane; OpenRouter is the redundancy lane and the brain for the consensus / Mythos modules. |
-| Neither | The container still boots, the UI still renders, but every LLM-bound action will fail-fast with a clear error. The static gates (Bandit, Semgrep, pip-audit, Z3) still work because they are purely local. |
+| `DO_INFERENCE_API_KEY` only | **Recommended.** The full system runs on the DO paid lane. Adversarial reviewer, Mythos, Hermes, Aider — everything routes to DO first. The three OR-only roles (RECON, FALLBACK, FALLBACK_ALT) silently fall back to a TRIAGE/HERMES model from the DO catalog. |
+| `OPENROUTER_API_KEY` only | Everything still works on the OR slow-lane. DO is skipped entirely. |
+| Both | Optimal. DO is the fast paid lane; OR catches DO failures *and* unlocks the kimi-k2.5 / claude-4.6-sonnet / minimax-m2.5 emergency tier. |
+| Neither | The container fails fast at startup with a clear error from `app.py`. Static gates (Bandit, Semgrep, pip-audit, Z3) still work because they are purely local. |
 
 ### How a single key becomes "many brains"
 
