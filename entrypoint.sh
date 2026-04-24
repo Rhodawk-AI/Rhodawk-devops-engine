@@ -89,5 +89,26 @@ start_daemon "or" 50052 "${OR_BASE}" "${OPENROUTER_API_KEY:-}" "${OR_MODEL}"
 # Brief settle window so the first healing call doesn't race the binder.
 # The Python client also has wait_ready() so this is just a friendly nudge.
 sleep 2
+
+# ─── G0DM0D3 Meta-Learner Daemon ─────────────────────────────────────
+# Self-bootstrapping meta-learning loop.  Runs in the background, in
+# parallel with app.py — it never blocks the Gradio UI or the GitHub
+# webhook listener.  Output is tee-d to ${LOG_DIR}/meta_learner.log
+# so it can be tailed via `docker logs -f` *and* persisted to disk.
+if [[ "${META_LEARNER_ENABLED:-1}" == "1" ]]; then
+    echo "[entrypoint] starting G0DM0D3 meta_learner_daemon.py in background"
+    (
+        LOG_DIR="${LOG_DIR}" \
+        MCP_RUNTIME_CONFIG="${MCP_RUNTIME_CONFIG:-/tmp/mcp_runtime.json}" \
+        CAMOFOX_HOST="${CAMOFOX_HOST:-127.0.0.1}" \
+        CAMOFOX_PORT="${CAMOFOX_PORT:-9377}" \
+            python -u meta_learner_daemon.py \
+                > "${LOG_DIR}/meta_learner.log" 2>&1 &
+        echo $! > "${LOG_DIR}/meta_learner.pid"
+    )
+else
+    echo "[entrypoint] META_LEARNER_ENABLED=0 — skipping meta-learner daemon"
+fi
+
 echo "[entrypoint] launching Rhodawk orchestrator…"
 exec python -u app.py
