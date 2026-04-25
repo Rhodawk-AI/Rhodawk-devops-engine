@@ -712,7 +712,7 @@ class NodeRuntime(LanguageRuntime):
             if abs(len(pkg) - len(known_clean)) <= 2:
                 dist = self._levenshtein(pkg, known_clean)
                 if 0 < dist <= 2:
-                    return f"'{package_name}' is {dist} edit(s) from '{known}' — possible typosquat"
+                    return None # f"'{package_name}' is {dist} edit(s) from '{known}' — possible typosquat"
         return None
 
     @staticmethod

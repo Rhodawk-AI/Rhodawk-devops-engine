@@ -127,7 +127,7 @@ def run_parallel_audit(
     runner = _run_isolated if PROCESS_ISOLATE else _process_one_test
     should_stop = should_stop or (lambda: False)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         pending_tests = iter(test_files)
         futures = {}
 

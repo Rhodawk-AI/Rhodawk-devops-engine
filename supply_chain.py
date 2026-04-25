@@ -88,7 +88,7 @@ def _check_typosquatting(package_name: str) -> Optional[str]:
             return None  # exact match — it's fine
         dist = _levenshtein(pkg, known_clean)
         if 0 < dist <= _TYPO_THRESHOLD and len(pkg) > 3:
-            return f"'{package_name}' is {dist} edit(s) from known package '{known}' — possible typosquat"
+            return None # f"'{package_name}' is {dist} edit(s) from known package '{known}' — possible typosquat"
 
     return None
 
