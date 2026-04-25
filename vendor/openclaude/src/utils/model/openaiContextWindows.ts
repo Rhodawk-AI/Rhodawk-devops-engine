@@ -114,7 +114,7 @@ const OPENAI_CONTEXT_WINDOWS: Record<string, number> = {
   'meta/llama-3.2-90b-instruct': 128_000,
   'meta/llama-3.2-1b-instruct': 128_000,
   'meta/llama-3.2-3b-instruct': 128_000,
-  'meta/llama-3.3-70b-instruct': 128_000,
+  'meta/llama3.3-70b-instruct': 128_000,
   // Google Gemma via NVIDIA NIM
   'google/gemma-2-27b-it': 8_192,
   'google/gemma-2-9b-it': 8_192,
@@ -372,7 +372,7 @@ const OPENAI_MAX_OUTPUT_TOKENS: Record<string, number> = {
   'meta/llama-3.1-405b-instruct': 32_768,
   'meta/llama-3.1-70b-instruct': 32_768,
   'meta/llama-3.2-90b-instruct': 32_768,
-  'meta/llama-3.3-70b-instruct': 32_768,
+  'meta/llama3.3-70b-instruct': 32_768,
   'google/gemma-2-27b-it': 4_096,
   'google/gemma-3-27b-it': 16_384,
   'google/gemma-3-12b-it': 16_384,

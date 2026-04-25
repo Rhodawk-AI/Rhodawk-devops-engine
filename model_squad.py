@@ -7,7 +7,7 @@ IDs held as a graceful FALLBACK.
 
 The squad (operator-facing names → role keys → model IDs)
 
-    1. The Hands       (EXECUTION)  llama-3.3-70b-instruct
+    1. The Hands       (EXECUTION)  llama3.3-70b-instruct
     2. The Brain       (HERMES)     deepseek-r1-distill-llama-70b
     3. The Reader      (RECON)      kimi-k2.5
     4. The Screener    (TRIAGE)     qwen3-32b
@@ -18,7 +18,7 @@ DigitalOcean Serverless Inference (PRIMARY)
 * Base URL  : https://inference.do-ai.run/v1   (override with DO_INFERENCE_BASE_URL)
 * Auth      : Authorization: Bearer ${DO_INFERENCE_API_KEY}
 * Endpoint  : POST /chat/completions   (OpenAI-compatible)
-* Hosted    : llama-3.3-70b-instruct, deepseek-r1-distill-llama-70b,
+* Hosted    : llama3.3-70b-instruct, deepseek-r1-distill-llama-70b,
               qwen3-32b-instruct + others — see DO catalog at
               https://docs.digitalocean.com/products/genai/serverless-inference/
 * Not hosted: kimi-k2.5, claude-4.6-sonnet, minimax-m2.5 — these
@@ -76,10 +76,10 @@ _DEFAULT_SQUAD: tuple[SquadModel, ...] = (
     SquadModel(
         role="EXECUTION",
         nickname="The Hands",
-        do_id=os.getenv("EXECUTION_MODEL", "llama-3.3-70b-instruct"),
+        do_id=os.getenv("EXECUTION_MODEL", "llama3.3-70b-instruct"),
         or_id=os.getenv(
             "EXECUTION_MODEL_OR",
-            "meta-llama/llama-3.3-70b-instruct",
+            "meta-llama/llama3.3-70b-instruct",
         ),
         on_do=True,
         purpose="primary executor — code edits, fix generation, tool calls",

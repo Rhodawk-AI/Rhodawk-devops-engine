@@ -68,7 +68,7 @@ function getNvidiaNimModels(): ModelOption[] {
     { value: 'meta/llama-3.2-11b-vision-instruct', label: 'Llama 3.2 11B Vision', description: 'Meta Llama' },
     { value: 'meta/llama-3.2-3b-instruct', label: 'Llama 3.2 3B', description: 'Meta Llama' },
     { value: 'meta/llama-3.2-1b-instruct', label: 'Llama 3.2 1B', description: 'Meta Llama' },
-    { value: 'meta/llama-3.3-70b-instruct', label: 'Llama 3.3 70B', description: 'Meta Llama' },
+    { value: 'meta/llama3.3-70b-instruct', label: 'Llama 3.3 70B', description: 'Meta Llama' },
     { value: 'meta/llama-4-maverick-17b-128e-instruct', label: 'Llama 4 Maverick 17B', description: 'Meta Llama' },
     { value: 'meta/llama-4-scout-17b-16e-instruct', label: 'Llama 4 Scout 17B', description: 'Meta Llama' },
     // GOOGLE GEMMA MODELS (text only - no vision)

@@ -32,15 +32,15 @@ LOG = logging.getLogger("mythos.agent")
 _DEFAULT_MODELS = {
     "tier1": [
         os.getenv("MYTHOS_TIER1_PRIMARY",  "deepseek-r1-distill-llama-70b"),
-        os.getenv("MYTHOS_TIER1_FALLBACK", "llama-3.3-70b-instruct"),
+        os.getenv("MYTHOS_TIER1_FALLBACK", "llama3.3-70b-instruct"),
         "qwen3-32b",
     ],
     "tier2": [
-        os.getenv("MYTHOS_TIER2_PRIMARY",  "llama-3.3-70b-instruct"),
+        os.getenv("MYTHOS_TIER2_PRIMARY",  "llama3.3-70b-instruct"),
         os.getenv("MYTHOS_TIER2_FALLBACK", "qwen3-32b"),
     ],
     "tier3": [
-        "llama-3.3-70b-instruct",
+        "llama3.3-70b-instruct",
         "deepseek-r1-distill-llama-70b",
         "qwen3-32b",
     ],
@@ -49,7 +49,7 @@ _DEFAULT_MODELS = {
 # Map DO catalog ids to their OpenRouter equivalents for the fallback path.
 _OR_FALLBACK_FOR: dict[str, str] = {
     "deepseek-r1-distill-llama-70b": "deepseek/deepseek-r1-distill-llama-70b",
-    "llama-3.3-70b-instruct":        "meta-llama/llama-3.3-70b-instruct",
+    "llama3.3-70b-instruct":        "meta-llama/llama3.3-70b-instruct",
     "qwen3-32b":                     "qwen/qwen3-32b",
     # Emergency-tier (OR-only) models, used when an operator overrides MYTHOS_*:
     "claude-4.6-sonnet":             "anthropic/claude-sonnet-4.6",

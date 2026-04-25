@@ -38,7 +38,7 @@ export const outputSchema = lazySchema(() =>
   z.object({
     matches: z.array(z.string()),
     query: z.string(),
-    total_deferred_tools: z.number(),
+    total_deferred_tools: z.coerce.number(),
     pending_mcp_servers: z.array(z.string()).optional(),
   }),
 )

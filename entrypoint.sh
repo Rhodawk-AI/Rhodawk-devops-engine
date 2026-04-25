@@ -81,7 +81,7 @@ start_camofox
 # 4. The Screener    (TRIAGE)    — fast cheap filtering
 # 5. The Safety Net  (FALLBACK)  — emergency tier (OR-only)
 # Override any of these via the container env to swap models.
-export EXECUTION_MODEL="${EXECUTION_MODEL:-llama-3.3-70b-instruct}"
+export EXECUTION_MODEL="${EXECUTION_MODEL:-llama3.3-70b-instruct}"
 export HERMES_MODEL="${HERMES_MODEL:-deepseek-r1-distill-llama-70b}"
 export RECON_MODEL="${RECON_MODEL:-kimi-k2.5}"
 export TRIAGE_MODEL="${TRIAGE_MODEL:-qwen3-32b}"
@@ -97,7 +97,7 @@ start_daemon "do" 50051 "${DO_BASE}" \
 
 # OpenRouter (FALLBACK) — drives the OpenClaude :50052 daemon (optional)
 OR_BASE="${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}"
-OR_MODEL="${OPENROUTER_MODEL:-meta-llama/llama-3.3-70b-instruct}"
+OR_MODEL="${OPENROUTER_MODEL:-meta-llama/llama3.3-70b-instruct}"
 start_daemon "or" 50052 "${OR_BASE}" "${OPENROUTER_API_KEY:-}" "${OR_MODEL}"
 
 # Brief settle window so the first healing call doesn't race the binder.

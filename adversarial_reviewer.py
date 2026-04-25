@@ -32,7 +32,7 @@ OPENROUTER_BASE_URL   = os.getenv(
 ADVERSARY_MODEL_PRIMARY   = os.getenv("RHODAWK_ADVERSARY_MODEL",
                                       "deepseek-r1-distill-llama-70b")
 ADVERSARY_MODEL_SECONDARY = os.getenv("RHODAWK_ADVERSARY_MODEL_2",
-                                      "llama-3.3-70b-instruct")
+                                      "llama3.3-70b-instruct")
 ADVERSARY_MODEL_TERTIARY  = os.getenv("RHODAWK_ADVERSARY_MODEL_3",
                                       "qwen3-32b")
 
@@ -41,7 +41,7 @@ _OR_FALLBACK_FOR: dict[str, str] = {
     ADVERSARY_MODEL_PRIMARY:   os.getenv(
         "RHODAWK_ADVERSARY_MODEL_OR",   "deepseek/deepseek-r1-distill-llama-70b"),
     ADVERSARY_MODEL_SECONDARY: os.getenv(
-        "RHODAWK_ADVERSARY_MODEL_2_OR", "meta-llama/llama-3.3-70b-instruct"),
+        "RHODAWK_ADVERSARY_MODEL_2_OR", "meta-llama/llama3.3-70b-instruct"),
     ADVERSARY_MODEL_TERTIARY:  os.getenv(
         "RHODAWK_ADVERSARY_MODEL_3_OR", "qwen/qwen3-32b"),
 }
