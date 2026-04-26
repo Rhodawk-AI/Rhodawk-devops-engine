@@ -3,25 +3,24 @@
 # Rhodawk runtime bootstrap.
 #
 # 1. Launch the camofox-browser anti-detection browser server on
-#    127.0.0.1:9377 (used by the orchestrator via camofox_client.py).
-# 2. Launch the OpenClaude headless gRPC daemon for the DigitalOcean
-#    Inference provider on :50051 (PRIMARY).
-# 3. Launch the OpenClaude headless gRPC daemon for OpenRouter on
-#    :50052 (FALLBACK) — only if OPENROUTER_API_KEY is present.
-# 4. Wait briefly for everything to bind, then hand control to app.py
-#    which talks to them over gRPC + HTTP.
+#    127.0.0.1:9377.
+# 2. Launch the OpenClaude headless gRPC daemons (do / or).
+# 3. Launch Nous Research Hermes Agent on :11434.
+# 4. Launch OpenClaw multi-channel gateway on :18789.
+# 5. Bootstrap the EmbodiedOS bridge + unified gateway + continuous
+#    learning daemon.
+# 6. Hand off to app.py (Gradio + webhook + legacy stack).
 # ─────────────────────────────────────────────────────────────────────
 set -eo pipefail
 
 OC_DIR=/opt/openclaude
 CAMOFOX_DIR=/opt/camofox
+HERMES_DIR="${HERMES_AGENT_HOME:-/opt/hermes-agent}"
+OPENCLAW_DIR="${OPENCLAW_HOME:-/opt/openclaw}"
 LOG_DIR="${LOG_DIR:-/tmp}"
 mkdir -p "${LOG_DIR}"
 
 # ─── camofox-browser ─────────────────────────────────────────────────
-# Anti-detection Firefox-fork browser server.  Lazily downloads the
-# Camoufox engine (~300MB) on first launch into the user's home dir,
-# so the first start may take a minute.  Subsequent starts are fast.
 start_camofox() {
     local entry="${CAMOFOX_DIR}/node_modules/@askjo/camofox-browser/server.js"
     [[ -f "${entry}" ]] || entry="${CAMOFOX_DIR}/node_modules/camofox-browser/server.js"
@@ -71,16 +70,61 @@ start_daemon() {
     )
 }
 
-# camofox first — slowest to bind because of the lazy engine download.
+# ─── NEW: Nous Research Hermes Agent ─────────────────────────────────
+start_hermes_agent() {
+    local hermes_bin="${HERMES_DIR}/bin/hermes"
+    if [[ ! -x "${hermes_bin}" ]]; then
+        echo "[entrypoint] Hermes Agent binary not found at ${hermes_bin} — skipping"
+        return 0
+    fi
+    echo "[entrypoint] starting Hermes Agent on :${HERMES_AGENT_PORT:-11434}"
+    (
+        # Hermes Agent uses the OpenAI-compatible API; set the provider vars.
+        HERMES_AGENT_API_KEY="${HERMES_AGENT_API_KEY:-${OPENROUTER_API_KEY:-}}" \
+        HERMES_AGENT_BASE_URL="${HERMES_AGENT_BASE_URL:-${OPENROUTER_BASE_URL:-}}" \
+        HERMES_AGENT_MODEL="${HERMES_AGENT_MODEL:-${HERMES_MODEL:-}}" \
+        HERMES_AGENT_PORT="${HERMES_AGENT_PORT:-11434}" \
+        HERMES_MCP_CONFIG="${HERMES_MCP_CONFIG:-/tmp/mcp_runtime.embodied.json}" \
+        HERMES_SKILLS_DIR="${HERMES_SKILLS_DIR:-${HOME}/.hermes/skills}" \
+            "${hermes_bin}" agent start \
+                --port "${HERMES_AGENT_PORT:-11434}" \
+                --mcp-config "${HERMES_MCP_CONFIG:-/tmp/mcp_runtime.embodied.json}" \
+                > "${LOG_DIR}/hermes-agent.log" 2>&1 &
+        echo $! > "${LOG_DIR}/hermes-agent.pid"
+    )
+}
+
+# ─── NEW: OpenClaw multi-channel gateway ─────────────────────────────
+start_openclaw_gateway() {
+    local openclaw_bin="${OPENCLAW_DIR}/bin/openclaw"
+    if [[ ! -x "${openclaw_bin}" ]]; then
+        # Fallback: try global npm binary
+        if command -v openclaw >/dev/null 2>&1; then
+            openclaw_bin=$(command -v openclaw)
+        else
+            echo "[entrypoint] OpenClaw binary not found — skipping"
+            return 0
+        fi
+    fi
+    echo "[entrypoint] starting OpenClaw gateway on :${OPENCLAW_GATEWAY_PORT:-18789}"
+    (
+        OPENCLAW_TOKEN="${OPENCLAW_TOKEN:-}" \
+        OPENCLAW_MCP_CONFIG="${OPENCLAW_MCP_CONFIG:-/tmp/openclaw_mcp.embodied.json}" \
+        OPENCLAW_SKILLS_DIR="${OPENCLAW_SKILLS_DIR:-${HOME}/.openclaw/skills}" \
+            "${openclaw_bin}" gateway start \
+                --port "${OPENCLAW_GATEWAY_PORT:-18789}" \
+                --mcp-config "${OPENCLAW_MCP_CONFIG:-}" \
+                > "${LOG_DIR}/openclaw.log" 2>&1 &
+        echo $! > "${LOG_DIR}/openclaw.pid"
+    )
+}
+
+# ─── ORDER OF OPERATIONS ─────────────────────────────────────────────
+
+# 1. camofox (slowest, lazy engine download)
 start_camofox
 
-# ─── THE MODEL SQUAD (DigitalOcean primary, OpenRouter fallback) ─────
-# 1. The Hands       (EXECUTION) — primary executor / patch generation
-# 2. The Brain       (HERMES)    — reasoning + Godmode meta-learning
-# 3. The Reader      (RECON)     — massive context ingestion (OR-only today)
-# 4. The Screener    (TRIAGE)    — fast cheap filtering
-# 5. The Safety Net  (FALLBACK)  — emergency tier (OR-only)
-# Override any of these via the container env to swap models.
+# 2. OpenClaude gRPC daemons (do / or)
 export EXECUTION_MODEL="${EXECUTION_MODEL:-llama3.3-70b-instruct}"
 export HERMES_MODEL="${HERMES_MODEL:-deepseek-r1-distill-llama-70b}"
 export RECON_MODEL="${RECON_MODEL:-kimi-k2.5}"
@@ -88,27 +132,28 @@ export TRIAGE_MODEL="${TRIAGE_MODEL:-qwen3-32b}"
 export FALLBACK_MODEL="${FALLBACK_MODEL:-claude-4.6-sonnet}"
 export FALLBACK_MODEL_ALT="${FALLBACK_MODEL_ALT:-minimax-m2.5}"
 
-# DigitalOcean Inference (PRIMARY) — drives the OpenClaude :50051 daemon
 DO_BASE="${DO_INFERENCE_BASE_URL:-https://inference.do-ai.run/v1}"
 DO_MODEL="${DO_INFERENCE_MODEL:-${EXECUTION_MODEL}}"
 start_daemon "do" 50051 "${DO_BASE}" \
     "${DO_INFERENCE_API_KEY:-${DIGITALOCEAN_INFERENCE_KEY:-}}" \
     "${DO_MODEL}"
 
-# OpenRouter (FALLBACK) — drives the OpenClaude :50052 daemon (optional)
 OR_BASE="${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}"
 OR_MODEL="${OPENROUTER_MODEL:-meta-llama/llama3.3-70b-instruct}"
 start_daemon "or" 50052 "${OR_BASE}" "${OPENROUTER_API_KEY:-}" "${OR_MODEL}"
 
-# Brief settle window so the first healing call doesn't race the binder.
-# The Python client also has wait_ready() so this is just a friendly nudge.
 sleep 2
 
-# ─── G0DM0D3 Meta-Learner Daemon ─────────────────────────────────────
-# Self-bootstrapping meta-learning loop.  Runs in the background, in
-# parallel with app.py — it never blocks the Gradio UI or the GitHub
-# webhook listener.  Output is tee-d to ${LOG_DIR}/meta_learner.log
-# so it can be tailed via `docker logs -f` *and* persisted to disk.
+# 3. Hermes Agent
+start_hermes_agent
+
+# 4. OpenClaw Gateway
+start_openclaw_gateway
+
+# Let them bind before the bridge tries to connect
+sleep 2
+
+# 5. G0DM0D3 Meta-Learner Daemon (legacy)
 if [[ "${META_LEARNER_ENABLED:-1}" == "1" ]]; then
     echo "[entrypoint] starting G0DM0D3 meta_learner_daemon.py in background"
     (
@@ -124,26 +169,9 @@ else
     echo "[entrypoint] META_LEARNER_ENABLED=0 — skipping meta-learner daemon"
 fi
 
-# EmbodiedOS = Hermes + OpenClaw unified front-of-house.  app.py already
-# wires the OpenClaw HTTP gateway behind OPENCLAW=1; we default it ON so
-# the unified NL command surface (POST /openclaw/command + Telegram
-# webhook + the new mission_repo / mission_bounty intents registered by
-# embodied_os.py) is live as soon as the container is up.
+# 6. EmbodiedOS unified bootstrap (bridge, gateway, research)
 export OPENCLAW="${OPENCLAW:-1}"
 
-# ─── EmbodiedOS bootstrap (sections 4.1 – 4.7) ───────────────────────
-# Spins up the new ``embodied`` package's three always-on services in
-# background threads inside a single Python process:
-#
-#   • MCP bridge       (HTTP, default :8600)  — exposes Rhodawk tools
-#                                                to Hermes Agent + OpenClaw.
-#   • Unified gateway  (HTTP, default :8601)  — Telegram / Discord /
-#                                                Slack / OpenClaw / direct.
-#   • Research daemon  (continuous)           — fetches CVEs / writeups
-#                                                and auto-distils them
-#                                                into agentskills.io skills.
-#
-# Disable any of these via the matching env flag (see .env.example).
 if [[ "${EMBODIED_OS_ENABLED:-1}" == "1" ]]; then
     echo "[entrypoint] starting EmbodiedOS bootstrap (bridge + gateway + learner)…"
     (
