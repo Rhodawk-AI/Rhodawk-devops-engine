@@ -131,5 +131,52 @@ fi
 # embodied_os.py) is live as soon as the container is up.
 export OPENCLAW="${OPENCLAW:-1}"
 
+# ─── EmbodiedOS bootstrap (sections 4.1 – 4.7) ───────────────────────
+# Spins up the new ``embodied`` package's three always-on services in
+# background threads inside a single Python process:
+#
+#   • MCP bridge       (HTTP, default :8600)  — exposes Rhodawk tools
+#                                                to Hermes Agent + OpenClaw.
+#   • Unified gateway  (HTTP, default :8601)  — Telegram / Discord /
+#                                                Slack / OpenClaw / direct.
+#   • Research daemon  (continuous)           — fetches CVEs / writeups
+#                                                and auto-distils them
+#                                                into agentskills.io skills.
+#
+# Disable any of these via the matching env flag (see .env.example).
+if [[ "${EMBODIED_OS_ENABLED:-1}" == "1" ]]; then
+    echo "[entrypoint] starting EmbodiedOS bootstrap (bridge + gateway + learner)…"
+    (
+        LOG_DIR="${LOG_DIR}" \
+        EMBODIED_BRIDGE_HOST="${EMBODIED_BRIDGE_HOST:-127.0.0.1}" \
+        EMBODIED_BRIDGE_PORT="${EMBODIED_BRIDGE_PORT:-8600}" \
+        EMBODIED_BRIDGE_TRANSPORT="${EMBODIED_BRIDGE_TRANSPORT:-http}" \
+        EMBODIED_BRIDGE_SECRET="${EMBODIED_BRIDGE_SECRET:-}" \
+        HERMES_AGENT_URL="${HERMES_AGENT_URL:-http://127.0.0.1:8400}" \
+        HERMES_AGENT_API_KEY="${HERMES_AGENT_API_KEY:-}" \
+        HERMES_SKILLS_DIR="${HERMES_SKILLS_DIR:-${HOME}/.hermes/skills}" \
+        OPENCLAW_BASE_URL="${OPENCLAW_BASE_URL:-http://127.0.0.1:8500}" \
+        OPENCLAW_API_KEY="${OPENCLAW_API_KEY:-}" \
+        OPENCLAW_SKILLS_DIR="${OPENCLAW_SKILLS_DIR:-${HOME}/.openclaw/skills}" \
+        EMBODIED_SKILL_CACHE="${EMBODIED_SKILL_CACHE:-/tmp/embodied_skill_cache}" \
+        EMBODIED_EPISODIC_DB="${EMBODIED_EPISODIC_DB:-/data/embodied_episodic.sqlite}" \
+        EMBODIED_LEARNING_ENABLED="${EMBODIED_LEARNING_ENABLED:-1}" \
+        EMBODIED_AUTOSUBMIT="${EMBODIED_AUTOSUBMIT:-0}" \
+            python -u -m embodied bootstrap \
+                > "${LOG_DIR}/embodied_os.log" 2>&1 &
+        echo $! > "${LOG_DIR}/embodied_os.pid"
+    )
+
+    # Emit fresh MCP registration files so Hermes Agent + OpenClaw can
+    # discover the bridge on their next reconnect.  Best-effort.
+    python -u -c "from embodied.bridge.mcp_server import build_server; \
+                  s = build_server(); \
+                  s.emit_hermes_registration('/tmp/mcp_runtime.embodied.json'); \
+                  s.emit_openclaw_registration('/tmp/openclaw_mcp.embodied.json')" \
+        2>>"${LOG_DIR}/embodied_os.log" || true
+else
+    echo "[entrypoint] EMBODIED_OS_ENABLED=0 — EmbodiedOS bootstrap skipped"
+fi
+
 echo "[entrypoint] launching Rhodawk orchestrator (EmbodiedOS=on)…"
 exec python -u app.py
