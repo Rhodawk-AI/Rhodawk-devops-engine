@@ -205,6 +205,32 @@ def _default_pipeline_dispatcher(intent: str, args: dict[str, Any]) -> dict[str,
     if intent == "side2.scrape":
         from embodied.pipelines.bounty_hunter import scrape_programs
         return scrape_programs()
+    if intent == "campaign.start":
+        from embodied.pipelines.campaign_runner import start_campaign_in_background
+        stacks_arg = (args.get("stacks") or "").strip()
+        stacks = [s for s in stacks_arg.split(",") if s] if stacks_arg else None
+        start_campaign_in_background(stacks=stacks, bounty_only=False)
+        return {"ok": True, "intent": intent, "started": True, "stacks": stacks or "all"}
+    if intent == "campaign.bounty":
+        from embodied.pipelines.campaign_runner import start_campaign_in_background
+        start_campaign_in_background(bounty_only=True)
+        return {"ok": True, "intent": intent, "started": True, "bounty_only": True}
+    if intent == "campaign.stop":
+        from embodied.pipelines.campaign_runner import request_stop
+        request_stop()
+        return {"ok": True, "intent": intent, "stop_requested": True}
+    if intent == "campaign.reset":
+        from embodied.pipelines.campaign_runner import reset_cursor
+        reset_cursor()
+        return {"ok": True, "intent": intent, "cursor_reset": True}
+    if intent == "campaign.status":
+        import json as _json, os as _os
+        path = _os.getenv("RHODAWK_CAMPAIGN_STATE", "/data/campaign_state.json")
+        try:
+            with open(path) as fh:
+                return {"ok": True, "intent": intent, "state": _json.load(fh)}
+        except Exception:
+            return {"ok": True, "intent": intent, "state": {"cursor": 0, "completed": []}}
     if intent == "maintenance.status":
         from embodied.pipelines.bounty_hunter import status as side2_status
         from embodied.pipelines.repo_hunter import status as side1_status

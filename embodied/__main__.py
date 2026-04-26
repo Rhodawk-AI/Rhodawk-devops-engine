@@ -34,6 +34,11 @@ from embodied.bridge.mcp_server import serve as serve_bridge
 from embodied.config import get_config
 from embodied.learning.research_daemon import run_once as learn_once, start_daemon as start_learning
 from embodied.pipelines.bounty_hunter import run_bounty_hunter, scan_bounty_program
+from embodied.pipelines.campaign_runner import (
+    request_stop as campaign_request_stop,
+    reset_cursor as campaign_reset_cursor,
+    run_campaign,
+)
 from embodied.pipelines.repo_hunter import run_repo_hunter
 from embodied.router.unified_gateway import build_gateway, serve_in_background
 from embodied.skills.sync_engine import get_engine
@@ -90,6 +95,28 @@ def _cmd_side2(args: argparse.Namespace) -> int:
     else:
         out = run_bounty_hunter()
     print(json.dumps(out, indent=2, default=str))
+    return 0
+
+
+def _cmd_campaign(args: argparse.Namespace) -> int:
+    if args.stop:
+        campaign_request_stop()
+        print(json.dumps({"ok": True, "stop_requested": True}))
+        return 0
+    if args.reset:
+        campaign_reset_cursor()
+        print(json.dumps({"ok": True, "cursor_reset": True}))
+        return 0
+    stacks = [s.strip().lower() for s in (args.stacks or "").split(",") if s.strip()]
+    rep = run_campaign(
+        stacks=stacks or None,
+        bounty_only=args.bounty_only,
+        target_budget_s=args.budget,
+        cycle_pause_s=args.pause,
+        max_targets=args.max_targets,
+        resume=not args.no_resume,
+    )
+    print(json.dumps(rep.to_dict(), indent=2, default=str))
     return 0
 
 
@@ -162,6 +189,26 @@ def _build_parser() -> argparse.ArgumentParser:
     p2 = sub.add_parser("side2", help="Run Side 2 — one bounty cycle.")
     p2.add_argument("--program", default=None, help="<PLATFORM>/<handle>, e.g. HACKERONE/shopify")
     p2.set_defaults(func=_cmd_side2)
+
+    pc = sub.add_parser("campaign",
+                        help="Continuous hunt across the curated high-value-target list.")
+    pc.add_argument("--stacks", default="",
+                    help="Comma-separated stack filter (e.g. 'c,go,rust'). Empty = all.")
+    pc.add_argument("--bounty-only", action="store_true",
+                    help="Only run targets with a known public bounty programme.")
+    pc.add_argument("--budget", type=int, default=1800,
+                    help="Wall-clock budget per target in seconds (default 1800).")
+    pc.add_argument("--pause",  type=int, default=60,
+                    help="Pause between targets in seconds (default 60).")
+    pc.add_argument("--max-targets", type=int, default=0,
+                    help="Stop after N targets (0 = no limit, full lap).")
+    pc.add_argument("--no-resume", action="store_true",
+                    help="Ignore persisted cursor; start the lap from target 0.")
+    pc.add_argument("--stop", action="store_true",
+                    help="Ask a running campaign to stop after the current target.")
+    pc.add_argument("--reset", action="store_true",
+                    help="Reset the persisted cursor + completed list to zero.")
+    pc.set_defaults(func=_cmd_campaign)
 
     pbo = sub.add_parser("bootstrap", help="Start every EmbodiedOS service (used by entrypoint.sh).")
     pbo.set_defaults(func=_cmd_bootstrap)

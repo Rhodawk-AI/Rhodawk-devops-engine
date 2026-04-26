@@ -195,6 +195,40 @@ class IntentRouter:
             help="`scrape programs` — refresh the live H1/BC/Intigriti index.",
         )
 
+        # ── Continuous campaign across the curated high-value-target list ─
+        self.register(
+            name="campaign.start",
+            pattern=r"^\s*(?:go\s+hunt|start\s+campaign|campaign\s+start|begin\s+hunt|hunt\s+all)"
+                    r"(?:\s+(?P<stacks>[a-zA-Z0-9_+,\-]+))?\s*$",
+            side="side1",
+            help="`go hunt [stacks]` — round-robin the curated high-value OSS list. "
+                 "Optional comma stack filter, e.g. `go hunt c,go,rust`.",
+        )
+        self.register(
+            name="campaign.bounty",
+            pattern=r"^\s*(?:hunt\s+bounty\s+targets|campaign\s+bounty)\s*$",
+            side="side1",
+            help="`hunt bounty targets` — run the campaign only on targets with public bounty programmes.",
+        )
+        self.register(
+            name="campaign.stop",
+            pattern=r"^\s*(?:stop\s+campaign|campaign\s+stop|halt\s+hunt)\s*$",
+            side="maintenance",
+            help="`stop campaign` — finish the current target then exit cleanly.",
+        )
+        self.register(
+            name="campaign.reset",
+            pattern=r"^\s*(?:reset\s+campaign|campaign\s+reset)\s*$",
+            side="maintenance",
+            help="`reset campaign` — clear the persisted cursor and completed list.",
+        )
+        self.register(
+            name="campaign.status",
+            pattern=r"^\s*(?:campaign\s+status|hunt\s+status)\s*$",
+            side="info",
+            help="`campaign status` — show the persisted cursor + last target.",
+        )
+
         # ── Maintenance / info — re-use OpenClaw verbatim where possible ──
         self.register(
             name="maintenance.status",
