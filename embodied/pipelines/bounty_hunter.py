@@ -109,22 +109,41 @@ def status(mission_id: str | None = None) -> dict[str, Any]:
 
 
 def scrape_programs(*, platform: str | None = None, min_payout: int = 0) -> dict[str, Any]:
-    bg = _safe_import("bounty_gateway")
-    if bg is None or not hasattr(bg, "scrape_programs"):
-        return {"ok": False, "reason": "bounty_gateway_unavailable"}
-    try:
-        progs = bg.scrape_programs(platform=platform, min_payout=min_payout) or []
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "reason": "scrape_failed", "exception": repr(exc)}
+    """Discover active bounty programs via the existing scope_parser MCP."""
+    progs: list[dict[str, Any]] = []
 
-    # Enrich with scope parser if available.
+    # Primary source: mythos scope_parser_mcp aggregator.
     scope_mod = _safe_import("mythos.mcp.scope_parser_mcp")
-    if scope_mod is not None and hasattr(scope_mod, "parse_scope"):
-        for p in progs:
+    if scope_mod is not None and hasattr(scope_mod, "list_active_programs"):
+        try:
+            res = scope_mod.list_active_programs(platforms=[platform] if platform else None) or {}
+            progs = list(res.get("programs", []))
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "reason": "list_active_programs_failed", "exception": repr(exc)}
+
+    # Optional fallback: any custom scrape_programs() the operator has wired
+    # into bounty_gateway.  Existing repo only ships submission helpers.
+    if not progs:
+        bg = _safe_import("bounty_gateway")
+        if bg is not None and hasattr(bg, "scrape_programs"):
             try:
-                p["scope"] = scope_mod.parse_scope(p.get("scope_url") or p.get("url") or "")
+                progs = list(bg.scrape_programs(platform=platform, min_payout=min_payout) or [])
             except Exception:  # noqa: BLE001
-                p["scope"] = {"in_scope": [], "out_of_scope": []}
+                pass
+
+    # Apply payout floor.
+    def _payout(p: dict[str, Any]) -> int:
+        for k in ("payout", "max_bounty", "max_payout", "bounty"):
+            try:
+                v = int(p.get(k, 0) or 0)
+                if v:
+                    return v
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    if min_payout > 0:
+        progs = [p for p in progs if _payout(p) >= min_payout]
 
     return {"ok": True, "count": len(progs), "programs": progs}
 
@@ -225,17 +244,19 @@ def run_bounty_hunter(*, platform: str | None = None, min_payout: int = 1000) ->
 
 
 def _score_program(platform: str, program: str, mission: BountyHunterReport) -> float:
-    score = 0.0
+    score = 1.0  # baseline so unscored-but-valid programs still proceed.
     scorer = _safe_import("oss_target_scorer")
-    if scorer is not None and hasattr(scorer, "score"):
+    if scorer is not None and hasattr(scorer, "score_repo"):
         try:
-            score = float(scorer.score({"platform": platform, "program": program}))
+            ts = scorer.score_repo({"full_name": program, "platform": platform})
+            score += float(getattr(ts, "score", getattr(ts, "value", 0)) or 0)
         except Exception:  # noqa: BLE001
             pass
     cl = _safe_import("bugbounty_checklist")
-    if cl is not None and hasattr(cl, "score"):
+    if cl is not None and hasattr(cl, "match_for_tag"):
         try:
-            score += float(cl.score(program))
+            if cl.match_for_tag(program) is not None:
+                score += 1.0   # known checklist boost
         except Exception:  # noqa: BLE001
             pass
     mission.notes.append(f"Program score: {score:.2f}")

@@ -363,3 +363,122 @@ Rhodawk AI Security Research Team
     conn.close()
 
     return msg
+
+
+# ---------------------------------------------------------------------------
+# Maintainer-email enumeration (used by EmbodiedOS Side 1 zero-day route).
+#
+# This function ONLY collects candidate addresses into the dossier so the
+# operator can review them before sending anything.  Nothing is ever sent
+# from inside this function.  Email delivery happens manually via the
+# operator's own MUA after the dossier is approved.
+# ---------------------------------------------------------------------------
+
+
+def scrape_developer_emails(
+    repo: str,
+    workdir: Optional[str] = None,
+    *,
+    limit: int = 25,
+) -> list[str]:
+    """Best-effort enumeration of maintainer email candidates for a repo.
+
+    Sources, in order of preference:
+      1. ``git log --format=%ae`` in the local clone (most reliable).
+      2. ``CODEOWNERS`` / ``MAINTAINERS`` / ``MAINTAINERS.md`` files.
+      3. ``package.json`` author/maintainers, ``setup.py`` ``author_email``,
+         ``pyproject.toml`` ``[project].authors[].email``.
+
+    GitHub-noreply, dependabot, github-actions, and other bot addresses
+    are filtered out so the resulting list is reviewable by a human.
+    Returns a deduplicated, lower-cased list (most-frequent first).
+    """
+    import re
+    import subprocess
+    from collections import Counter
+
+    BOT_PATTERNS = (
+        "noreply.github.com",
+        "users.noreply.github.com",
+        "dependabot",
+        "github-actions",
+        "renovate",
+        "snyk-bot",
+        "greenkeeper",
+        "actions@github.com",
+        "@bots.",
+        "no-reply",
+        "noreply@",
+    )
+    EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+
+    def _is_bot(addr: str) -> bool:
+        a = addr.lower()
+        return any(p in a for p in BOT_PATTERNS)
+
+    counter: Counter[str] = Counter()
+
+    # 1) git log on the local clone.
+    if workdir:
+        try:
+            out = subprocess.check_output(
+                ["git", "-C", str(workdir), "log", "--format=%ae", "-n", "1500"],
+                stderr=subprocess.DEVNULL,
+                timeout=20,
+            ).decode("utf-8", "ignore")
+            for line in out.splitlines():
+                addr = line.strip().lower()
+                if EMAIL_RE.fullmatch(addr) and not _is_bot(addr):
+                    counter[addr] += 3        # weight git authors highest
+        except Exception:
+            pass
+
+    # 2 + 3) static metadata files in the workdir.
+    if workdir:
+        wd = Path(workdir)
+        candidate_files = [
+            wd / "CODEOWNERS",
+            wd / ".github" / "CODEOWNERS",
+            wd / "docs" / "CODEOWNERS",
+            wd / "MAINTAINERS",
+            wd / "MAINTAINERS.md",
+            wd / "AUTHORS",
+            wd / "AUTHORS.md",
+            wd / "package.json",
+            wd / "setup.py",
+            wd / "setup.cfg",
+            wd / "pyproject.toml",
+            wd / "Cargo.toml",
+            wd / "composer.json",
+            wd / "Gemfile",
+        ]
+        for fp in candidate_files:
+            try:
+                text = fp.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            for addr in EMAIL_RE.findall(text):
+                addr = addr.lower()
+                if not _is_bot(addr):
+                    counter[addr] += 2
+
+    # Sort by frequency, dedup, cap.
+    ranked = [a for a, _ in counter.most_common(limit)]
+
+    # Persist into the dossier audit trail so the operator can see the
+    # scrape happened and which candidates surfaced.
+    try:
+        os.makedirs(VAULT_DIR, exist_ok=True)
+        sig = hashlib.sha256(repo.encode("utf-8")).hexdigest()[:12]
+        log_path = Path(VAULT_DIR) / f"maintainer_candidates_{sig}.json"
+        log_path.write_text(json.dumps({
+            "repo":       repo,
+            "scraped_at": time.time(),
+            "workdir":    str(workdir) if workdir else None,
+            "candidates": ranked,
+            "note":       "Pending human review — no email sent from this module.",
+        }, indent=2))
+    except Exception:
+        pass
+
+    return ranked

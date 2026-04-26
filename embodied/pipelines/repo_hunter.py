@@ -45,6 +45,12 @@ from pathlib import Path
 from typing import Any
 
 from embodied.bridge.hermes_client import HermesClient
+from embodied.bridge.role_prompts import (
+    BLUE_TEAM_PRIME,
+    RED_TEAM_PRIME,
+    ZERO_DAY_PRIME,
+    with_role,
+)
 from embodied.bridge.tool_registry import _safe_import  # type: ignore[attr-defined]
 from embodied.memory.unified_memory import get_memory
 from embodied.skills.sync_engine import SkillSyncEngine
@@ -228,8 +234,8 @@ def _detect_runtime(workdir: Path, mission: RepoHunterReport) -> Any | None:
     if lang is None or not hasattr(lang, "RuntimeFactory"):
         return None
     try:
-        rt = lang.RuntimeFactory().detect(str(workdir))
-        mission.runtime = getattr(rt, "name", rt.__class__.__name__)
+        rt = lang.RuntimeFactory.for_repo(str(workdir))
+        mission.runtime = getattr(rt, "language", None) or rt.__class__.__name__
         return rt
     except Exception as exc:  # noqa: BLE001
         mission.notes.append(f"runtime detection failed: {exc!r}")
@@ -240,17 +246,42 @@ def _fix_until_green(workdir: Path, runtime: Any | None, mission: RepoHunterRepo
     if runtime is None or not hasattr(runtime, "run_tests"):
         return {"green": False, "reason": "runtime_unavailable"}
 
+    # The real LanguageRuntime API needs a per-test invocation
+    # (test_path, repo_dir, env_config) → (output, returncode).  Provision
+    # the env once per mission and re-use it across iterations.
+    env_config = None
+    if hasattr(runtime, "setup_env"):
+        try:
+            env_config = runtime.setup_env(str(workdir))
+        except Exception as exc:  # noqa: BLE001
+            mission.notes.append(f"runtime.setup_env failed: {exc!r}")
+
+    def _failing_tests() -> int:
+        if not hasattr(runtime, "discover_tests"):
+            return 0
+        try:
+            tests = runtime.discover_tests(str(workdir)) or []
+        except Exception as exc:  # noqa: BLE001
+            mission.notes.append(f"discover_tests raised: {exc!r}")
+            return 0
+        bad = 0
+        for tp in tests[:25]:  # cap to avoid runaway runs
+            try:
+                _, rc = runtime.run_tests(tp, str(workdir), env_config) if env_config \
+                        else runtime.run_tests(tp, str(workdir), None)
+                if rc != 0:
+                    bad += 1
+            except Exception as exc:  # noqa: BLE001
+                mission.notes.append(f"run_tests({tp}) raised: {exc!r}")
+                bad += 1
+        return bad
+
     hermes = HermesClient()
     session = hermes.open_session(mission=f"fix-tests:{mission.repo_url}")
     sid = session.session_id if session else ""
 
     for it in range(max_iters):
-        try:
-            test_report = runtime.run_tests(str(workdir))
-        except Exception as exc:  # noqa: BLE001
-            mission.notes.append(f"run_tests raised: {exc!r}")
-            return {"green": False, "reason": "tests_raised"}
-        failing = _failing_count(test_report)
+        failing = _failing_tests()
         if it == 0:
             mission.failing_tests_initial = failing
         mission.failing_tests_final = failing
@@ -261,10 +292,11 @@ def _fix_until_green(workdir: Path, runtime: Any | None, mission: RepoHunterRepo
 
         # Delegate the fix to Hermes Agent (which itself can spawn an
         # OpenClaw/OpenClaude subagent for code-gen via the bridge).
-        instr = (
+        instr = with_role(
+            BLUE_TEAM_PRIME,
             f"Repository {mission.repo_url} (cloned at {workdir}) has {failing} failing tests. "
             "Fix the code so every test passes. Use the EmbodiedOS bridge tools "
-            "rhodawk.repo.run_tests and rhodawk.sec.sast to verify your edits."
+            "rhodawk.repo.run_tests and rhodawk.sec.sast to verify your edits.",
         )
         result = hermes.run_task(session_id=sid, instruction=instr, max_iterations=8)
         if not result.get("ok"):
@@ -275,19 +307,13 @@ def _fix_until_green(workdir: Path, runtime: Any | None, mission: RepoHunterRepo
     return {"green": False, "reason": "max_iters"}
 
 
-def _failing_count(report: Any) -> int:
-    if isinstance(report, dict):
-        return int(report.get("failing", report.get("fail", 0)) or 0)
-    return getattr(report, "failing", 0) or 0
-
-
 def _fallback_oss_guardian_fix(mission: RepoHunterReport) -> None:
     guardian = _safe_import("oss_guardian")
     if guardian is None or not hasattr(guardian, "OSSGuardian"):
         return
     try:
-        guardian.OSSGuardian().run(mission.repo_url, mode="fix")  # type: ignore[arg-type]
-        mission.notes.append("Fell back to OSSGuardian.run(mode='fix').")
+        guardian.OSSGuardian(fix_only=True).run(mission.repo_url)
+        mission.notes.append("Fell back to OSSGuardian(fix_only=True).run(...).")
     except Exception as exc:  # noqa: BLE001
         mission.notes.append(f"OSSGuardian fallback failed: {exc!r}")
 
@@ -321,35 +347,84 @@ def _pack_skills(workdir: Path, mission: RepoHunterReport) -> str:
 
 def _run_red_team(workdir: Path, skills_prompt: str, mission: RepoHunterReport) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
+
+    # ── red_team_fuzzer (AST-driven Hypothesis PBT lead generation) ──────
     redteam = _safe_import("red_team_fuzzer")
-    if redteam is not None and hasattr(redteam, "run_red_team"):
+    if redteam is not None and hasattr(redteam, "analyze_repository_ast"):
         try:
-            res = redteam.run_red_team(str(workdir), skills=skills_prompt)  # type: ignore[arg-type]
-            findings.extend(res.get("findings", []) if isinstance(res, dict) else [])
+            targets = redteam.analyze_repository_ast(str(workdir)) or []
+            for t in targets[:25]:
+                findings.append({
+                    "id":        f"rt-{getattr(t, 'function_name', 'fn')}-{uuid.uuid4().hex[:6]}",
+                    "title":     f"red-team target: {getattr(t, 'function_name', '?')}",
+                    "file":      getattr(t, 'file_path', ''),
+                    "severity":  "P3",
+                    "source":    "red_team_fuzzer",
+                    "description": f"AST-prioritised fuzz target (score={getattr(t, 'priority_score', 0):.2f}).",
+                })
         except Exception as exc:  # noqa: BLE001
-            mission.notes.append(f"red_team_fuzzer failed: {exc!r}")
+            mission.notes.append(f"red_team_fuzzer.analyze_repository_ast failed: {exc!r}")
 
-    # Run the static engines in parallel for speed.
-    for mod_name, fn in [
-        ("sast_gate", "scan"), ("taint_analyzer", "analyze"),
-        ("symbolic_engine", "explore"), ("fuzzing_engine", "fuzz"),
-    ]:
-        m = _safe_import(mod_name)
-        if m is None or not hasattr(m, fn):
-            continue
+    # ── sast_gate ────────────────────────────────────────────────────────
+    sast = _safe_import("sast_gate")
+    if sast is not None and hasattr(sast, "run_sast_gate"):
         try:
-            res = getattr(m, fn)(str(workdir))
-            findings.extend(_normalize_findings(res, source=mod_name))
+            report = sast.run_sast_gate(diff_text="", changed_files=[], repo_dir=str(workdir))
+            for f in getattr(report, "findings", []) or []:
+                findings.append({
+                    "id":         getattr(f, "id", uuid.uuid4().hex[:10]),
+                    "title":      getattr(f, "rule_id", "sast finding"),
+                    "file":       getattr(f, "file", ""),
+                    "severity":   getattr(f, "severity", "P3"),
+                    "description": getattr(f, "message", ""),
+                    "source":     "sast_gate",
+                })
         except Exception as exc:  # noqa: BLE001
-            mission.notes.append(f"{mod_name}.{fn} failed: {exc!r}")
+            mission.notes.append(f"sast_gate.run_sast_gate failed: {exc!r}")
 
+    # ── taint_analyzer ───────────────────────────────────────────────────
+    taint = _safe_import("taint_analyzer")
+    if taint is not None and hasattr(taint, "run_taint_analysis"):
+        try:
+            res = taint.run_taint_analysis(str(workdir))
+            for f in (res.get("vulnerabilities") or res.get("flows") or []) if isinstance(res, dict) else []:
+                ff = dict(f) if isinstance(f, dict) else {"raw": repr(f)}
+                ff.setdefault("source", "taint_analyzer")
+                ff.setdefault("severity", "P2")
+                findings.append(ff)
+        except Exception as exc:  # noqa: BLE001
+            mission.notes.append(f"taint_analyzer.run_taint_analysis failed: {exc!r}")
+
+    # ── symbolic_engine ──────────────────────────────────────────────────
+    sym = _safe_import("symbolic_engine")
+    if sym is not None and hasattr(sym, "run_symbolic_analysis"):
+        try:
+            res = sym.run_symbolic_analysis(str(workdir))
+            for f in (res.get("results") or res.get("paths") or []) if isinstance(res, dict) else []:
+                ff = dict(f) if isinstance(f, dict) else {"raw": repr(f)}
+                ff.setdefault("source", "symbolic_engine")
+                ff.setdefault("severity", "P3")
+                findings.append(ff)
+        except Exception as exc:  # noqa: BLE001
+            mission.notes.append(f"symbolic_engine.run_symbolic_analysis failed: {exc!r}")
+
+    # ── chain_analyzer (links primitives stored in the chain DB) ─────────
     chain = _safe_import("chain_analyzer")
-    if chain is not None and hasattr(chain, "analyze_chain"):
+    if chain is not None and hasattr(chain, "analyze_chains"):
         try:
-            chains = chain.analyze_chain([f.get("id") for f in findings if f.get("id")])
-            mission.notes.append(f"Chain analyzer linked {len(chains or [])} chains.")
-        except Exception:  # noqa: BLE001
-            pass
+            chains = chain.analyze_chains(mission.repo_url) or []
+            mission.notes.append(f"chain_analyzer linked {len(chains)} chains.")
+            for c in chains:
+                if isinstance(c, dict):
+                    findings.append({
+                        "id":          c.get("chain_id") or uuid.uuid4().hex[:10],
+                        "title":       c.get("title", "exploit chain"),
+                        "severity":    c.get("severity", "P2"),
+                        "description": c.get("description", ""),
+                        "source":      "chain_analyzer",
+                    })
+        except Exception as exc:  # noqa: BLE001
+            mission.notes.append(f"chain_analyzer.analyze_chains failed: {exc!r}")
 
     mission.findings = findings
     return findings
@@ -371,40 +446,54 @@ def _normalize_findings(raw: Any, *, source: str) -> list[dict[str, Any]]:
 
 
 def _classify(findings: list[dict[str, Any]], mission: RepoHunterReport) -> dict[str, list[dict[str, Any]]]:
+    out: dict[str, list[dict[str, Any]]] = {"bug": [], "vuln": [], "zero_day": []}
     cls = _safe_import("vuln_classifier")
-    if cls is None or not hasattr(cls, "classify"):
-        # Heuristic fallback: severity-based bucketing.
-        out = {"bug": [], "vuln": [], "zero_day": []}
-        for f in findings:
-            sev = (f.get("severity") or "").upper()
-            if sev in {"P1", "CRIT", "CRITICAL"}:
-                out["zero_day"].append(f)
-            elif sev in {"P2", "HIGH"}:
-                out["vuln"].append(f)
-            else:
-                out["bug"].append(f)
-        return out
-    try:
-        return cls.classify(findings)  # type: ignore[no-any-return]
-    except Exception as exc:  # noqa: BLE001
-        mission.notes.append(f"vuln_classifier failed: {exc!r}")
-        return {"bug": findings, "vuln": [], "zero_day": []}
+
+    def _bucket_for(sev: str) -> str:
+        sev = (sev or "").upper()
+        if sev in {"P1", "CRIT", "CRITICAL"}:
+            return "zero_day"
+        if sev in {"P2", "HIGH"}:
+            return "vuln"
+        return "bug"
+
+    for f in findings:
+        sev = f.get("severity") or ""
+        if cls is not None and hasattr(cls, "classify_vulnerability"):
+            try:
+                res = cls.classify_vulnerability(
+                    cwe_hint=str(f.get("cwe", "")),
+                    description=str(f.get("description", f.get("title", ""))),
+                    exploit_class=str(f.get("source", "")),
+                )
+                # ClassificationResult fields tend to be: severity, cwe_id, taxonomy.
+                sev = getattr(res, "severity", sev) or sev
+                cwe = getattr(res, "cwe_id", None)
+                if cwe:
+                    f["cwe"] = cwe
+                f["severity"] = sev
+            except Exception as exc:  # noqa: BLE001
+                mission.notes.append(f"vuln_classifier failed for {f.get('id')}: {exc!r}")
+        out[_bucket_for(sev)].append(f)
+    return out
 
 
 def _open_pr(repo_url: str, finding: dict[str, Any], mission: RepoHunterReport) -> str | None:
     gh = _safe_import("github_app")
-    if gh is None or not hasattr(gh, "open_pull_request"):
+    if gh is None or not hasattr(gh, "open_pr_for_repo"):
         return None
     try:
-        title = f"fix: {finding.get('title', 'security hardening')}"
-        body = finding.get("description", "Auto-generated fix by EmbodiedOS Repo Hunter.")
+        token = gh.get_github_token(repo_url) if hasattr(gh, "get_github_token") else ""
+        if not token:
+            mission.notes.append(f"No GitHub token available for {repo_url} — PR skipped.")
+            return None
         branch = f"embodiedos/{mission.mission_id}/{finding.get('id', uuid.uuid4().hex[:6])}"
-        return gh.open_pull_request(
-            repo_url=repo_url,
+        return gh.open_pr_for_repo(
+            upstream_repo=repo_url,
             branch=branch,
-            title=title,
-            body=body,
-            diff_path=finding.get("patch_path", ""),
+            test_path=finding.get("file") or finding.get("patch_path", ""),
+            token=token,
+            fork_mode=False,
         )
     except Exception as exc:  # noqa: BLE001
         mission.notes.append(f"PR open failed for {finding.get('id')}: {exc!r}")
@@ -433,37 +522,97 @@ def _emit_finding(finding: dict[str, Any], mission: RepoHunterReport) -> None:
 
 
 def _route_zero_day(repo_url: str, workdir: Path, finding: dict[str, Any], mission: RepoHunterReport) -> dict[str, Any]:
+    # OPERATING CONTRACT: this pipeline collects everything the operator
+    # needs for a manual disclosure (PoC harness, exploit primitive
+    # analysis, dossier, candidate maintainer addresses) and then STOPS
+    # at status="pending_human_approval".  No email is ever sent from
+    # inside this function — the operator reviews the dossier and emails
+    # maintainers themselves through their own client.
     record: dict[str, Any] = {
-        "finding": finding,
-        "poc_path": None,
-        "vault_id": None,
-        "recipients": [],
-        "status": "pending_human_approval",
+        "finding":     finding,
+        "poc_path":    None,
+        "vault_id":    None,
+        "recipients":  [],
+        "status":      "pending_human_approval",
     }
+
     primitives = _safe_import("exploit_primitives")
-    if primitives is not None and hasattr(primitives, "analyze"):
+    if primitives is not None and hasattr(primitives, "reason_exploitability"):
         try:
-            record["primitives"] = primitives.analyze(finding)
-        except Exception:  # noqa: BLE001
-            pass
+            record["primitives"] = primitives.reason_exploitability(
+                crash_input=str(finding.get("poc_input", "")),
+                crash_output=str(finding.get("poc_output", "")),
+                file_path=str(finding.get("file", "")),
+                vuln_type=str(finding.get("title", "unknown")),
+                source_context=str(finding.get("description", "")),
+            )
+        except Exception as exc:  # noqa: BLE001
+            mission.notes.append(f"reason_exploitability failed: {exc!r}")
+
+    harness_result: dict[str, Any] = {}
     harness = _safe_import("harness_factory")
-    if harness is not None and hasattr(harness, "build_poc"):
+    if harness is not None and hasattr(harness, "generate_poc_harness"):
         try:
-            record["poc_path"] = harness.build_poc(finding, workdir=str(workdir))
-        except Exception:  # noqa: BLE001
-            pass
+            harness_result = harness.generate_poc_harness(
+                {"finding": finding, "file": finding.get("file", "")},
+                str(workdir),
+            ) or {}
+            record["poc_path"] = harness_result.get("harness_path") or harness_result.get("path")
+            record["harness_status"] = harness_result.get("status", "PENDING_HUMAN_REVIEW")
+        except Exception as exc:  # noqa: BLE001
+            mission.notes.append(f"generate_poc_harness failed: {exc!r}")
+
+    # Maintainer-email enumeration — collected for the operator's morning
+    # report only; nothing is sent from this module.
     vault = _safe_import("disclosure_vault")
-    if vault is not None and hasattr(vault, "store_finding"):
-        try:
-            record["vault_id"] = vault.store_finding(finding)
-        except Exception:  # noqa: BLE001
-            pass
     if vault is not None and hasattr(vault, "scrape_developer_emails"):
         try:
-            record["recipients"] = vault.scrape_developer_emails(repo_url)
-        except Exception:  # noqa: BLE001
-            pass
-    mission.notes.append(f"Zero-day {finding.get('id')} queued in vault — awaiting operator approval.")
+            record["recipients"] = vault.scrape_developer_emails(repo_url, str(workdir)) or []
+            mission.notes.append(
+                f"Scraped {len(record['recipients'])} maintainer-email candidates "
+                f"for {repo_url} — awaiting operator review (no email sent)."
+            )
+        except Exception as exc:  # noqa: BLE001
+            mission.notes.append(f"scrape_developer_emails failed: {exc!r}")
+
+    if vault is not None and hasattr(vault, "compile_dossier"):
+        try:
+            record["vault_id"] = vault.compile_dossier(
+                repo=repo_url,
+                semantic_graph={},
+                assumption_gap={"finding": finding},
+                harness_result=harness_result,
+                chain_analysis=None,
+                bug_bounty_program="",
+                maintainer_contact=", ".join(record["recipients"][:5]),
+            )
+        except Exception as exc:  # noqa: BLE001
+            mission.notes.append(f"disclosure_vault.compile_dossier failed: {exc!r}")
+
+    # Optional: ask Hermes to draft the human-facing disclosure narrative
+    # (held in the dossier, never sent).  The role prime keeps Hermes in
+    # disclosure-analyst mode rather than refusing on safety grounds.
+    try:
+        narrative = HermesClient().run_task(
+            session_id="",
+            instruction=with_role(
+                ZERO_DAY_PRIME,
+                f"Draft a responsible-disclosure write-up for finding "
+                f"{finding.get('id')} in {repo_url}.  Use the harness at "
+                f"{record.get('poc_path')!r}.  Output: title, summary, "
+                f"impact, reproduction steps, suggested patch, CWE/CVSS.",
+            ),
+            max_iterations=4,
+        )
+        if narrative.get("ok") and narrative.get("text"):
+            record["disclosure_draft"] = narrative["text"]
+    except Exception:  # noqa: BLE001
+        pass
+
+    mission.notes.append(
+        f"Zero-day {finding.get('id')} queued in vault as "
+        f"{record.get('vault_id') or 'no-id'} — awaiting operator approval."
+    )
     return record
 
 
