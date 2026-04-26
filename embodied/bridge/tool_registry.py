@@ -615,6 +615,133 @@ _REGISTRY: ToolRegistry | None = None
 _REGISTRY_LOCK = threading.Lock()
 
 
+def _register_claude_context_tools(reg: ToolRegistry) -> None:
+    """
+    Claude Context MCP tools — semantic search over indexed repositories.
+
+    Backed by @zilliz/claude-context-mcp (Milvus vector store).
+    Requires: MILVUS_TOKEN, MILVUS_ADDRESS env vars.
+    """
+
+    def _index_repo(path: str, *, collection: str = "rhodawk_context") -> dict[str, Any]:
+        """
+        Index a local repository into the Milvus vector store.
+
+        Chunks all source files, generates embeddings, and upserts into
+        the named collection. Idempotent — re-indexing the same repo
+        overwrites existing chunks for that path.
+        """
+        mcp = _safe_import("claude_context_mcp")
+        if mcp is None:
+            return {"ok": False, "error": "claude_context_mcp not installed"}
+        try:
+            result = mcp.index_repository(path=path, collection=collection)  # type: ignore[attr-defined]
+            return {"ok": True, "chunks_indexed": result.get("count", 0),
+                    "collection": collection, "path": path}
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("claude_context.index_repo failed: %s", exc)
+            return {"ok": False, "error": str(exc)}
+
+    def _semantic_search(query: str, *, top_k: int = 8, collection: str = "rhodawk_context") -> dict[str, Any]:
+        """
+        Semantic search over indexed source code.
+
+        Returns the top-K most semantically similar code chunks to the
+        natural-language query. Results are injected into the active
+        red-team system prompt.
+        """
+        mcp = _safe_import("claude_context_mcp")
+        if mcp is None:
+            return {"ok": False, "error": "claude_context_mcp not installed", "results": []}
+        try:
+            hits = mcp.search(query=query, top_k=top_k, collection=collection)  # type: ignore[attr-defined]
+            return {
+                "ok": True,
+                "query": query,
+                "results": [
+                    {
+                        "file": h.get("file", ""),
+                        "line_start": h.get("line_start", 0),
+                        "score": round(h.get("score", 0.0), 4),
+                        "snippet": h.get("text", "")[:500],
+                    }
+                    for h in (hits or [])
+                ],
+            }
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("claude_context.semantic_search failed: %s", exc)
+            return {"ok": False, "error": str(exc), "results": []}
+
+    reg.register(EmbodiedTool(
+        name="rhodawk.context.index_repo",
+        summary="Index a local repository into the Claude Context vector store (Milvus).",
+        schema={
+            "type": "object",
+            "properties": {
+                "path":       {"type": "string", "description": "Absolute or relative path to the cloned repo."},
+                "collection": {"type": "string", "default": "rhodawk_context"},
+            },
+            "required": ["path"],
+        },
+        handler=_bind(_index_repo),
+        side="shared",
+        tags=("context", "semantic", "milvus"),
+    ))
+    reg.register(EmbodiedTool(
+        name="rhodawk.context.semantic_search",
+        summary="Semantic search over indexed source code via Claude Context (Milvus).",
+        schema={
+            "type": "object",
+            "properties": {
+                "query":      {"type": "string"},
+                "top_k":      {"type": "integer", "default": 8},
+                "collection": {"type": "string", "default": "rhodawk_context"},
+            },
+            "required": ["query"],
+        },
+        handler=_bind(_semantic_search),
+        side="shared",
+        tags=("context", "semantic", "milvus"),
+    ))
+
+
+def _register_evolution_tools(reg: ToolRegistry) -> None:
+    """GEPA skill evolution + Darwin Gödel Machine code evolution tools."""
+
+    def _run_gepa(dry_run: bool = True) -> dict[str, Any]:
+        from embodied.evolution.gepa_engine import run_gepa
+        return run_gepa(dry_run=dry_run)
+
+    def _run_dgm(dry_run: bool = True) -> dict[str, Any]:
+        from embodied.evolution.code_evolver import run_dgm
+        return run_dgm(dry_run=dry_run)
+
+    reg.register(EmbodiedTool(
+        name="embodied.evolution.gepa",
+        summary="Run a GEPA skill evolution cycle (dry_run=True by default — PRs require explicit opt-in).",
+        schema={
+            "type": "object",
+            "properties": {"dry_run": {"type": "boolean", "default": True}},
+        },
+        handler=_bind(_run_gepa),
+        requires_human=True,
+        side="shared",
+        tags=("evolution", "gepa", "skills"),
+    ))
+    reg.register(EmbodiedTool(
+        name="embodied.evolution.dgm",
+        summary="Run a Darwin Gödel Machine code evolution cycle (dry_run=True by default).",
+        schema={
+            "type": "object",
+            "properties": {"dry_run": {"type": "boolean", "default": True}},
+        },
+        handler=_bind(_run_dgm),
+        requires_human=True,
+        side="shared",
+        tags=("evolution", "dgm", "code"),
+    ))
+
+
 def default_registry() -> ToolRegistry:
     """Return the process-wide tool registry, building it on first call."""
     global _REGISTRY
@@ -628,6 +755,8 @@ def default_registry() -> ToolRegistry:
         _register_intel_tools(reg)
         _register_skill_and_memory_tools(reg)
         _register_pipeline_tools(reg)
+        _register_claude_context_tools(reg)
+        _register_evolution_tools(reg)
         LOG.info("EmbodiedOS tool registry built — %d tools", len(reg.list()))
         _REGISTRY = reg
         return _REGISTRY

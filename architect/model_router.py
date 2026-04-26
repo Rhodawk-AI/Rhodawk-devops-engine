@@ -152,6 +152,75 @@ def all_routes() -> dict[str, list[str]]:
     return dict(TASK_ROUTES)
 
 
+# ── AutoTune EMA — exponential-moving-average of ACTS scores per model ──────
+# Updates TASK_ROUTES in-process to promote higher-scoring models over time.
+# α = 0.15 (slow EMA, resists noise from single bad runs).
+# Caller should invoke `autotune_record(task, model, acts_score)` after every
+# scored consensus race. Call `autotune_promote()` periodically (e.g. hourly)
+# to apply EMA-derived ordering to TASK_ROUTES.
+
+import threading as _threading
+from collections import defaultdict as _defaultdict
+
+_EMA_ALPHA: float = float(os.getenv("AUTOTUNE_EMA_ALPHA", "0.15"))
+_EMA_MIN_SAMPLES: int = int(os.getenv("AUTOTUNE_EMA_MIN_SAMPLES", "5"))
+_ema_scores: dict[str, dict[str, float]] = _defaultdict(dict)   # task → model → ema
+_ema_counts: dict[str, dict[str, int]]  = _defaultdict(lambda: _defaultdict(int))
+_ema_lock = _threading.Lock()
+
+
+def autotune_record(task: str, model: str, acts_score: float) -> None:
+    """
+    Update the EMA for (task, model) with a new ACTS score.
+
+    Called automatically after every ``race()`` that produces a scored winner.
+    """
+    with _ema_lock:
+        prev = _ema_scores[task].get(model, acts_score)
+        _ema_scores[task][model] = _EMA_ALPHA * acts_score + (1.0 - _EMA_ALPHA) * prev
+        _ema_counts[task][model] += 1
+        LOG.debug(
+            "AutoTune EMA: task=%s model=%s acts=%.1f ema=%.1f (n=%d)",
+            task, model, acts_score,
+            _ema_scores[task][model],
+            _ema_counts[task][model],
+        )
+
+
+def autotune_promote() -> dict[str, list[str]]:
+    """
+    Re-order each task's model chain by descending EMA score.
+
+    Only models that have at least ``_EMA_MIN_SAMPLES`` samples are eligible
+    for promotion.  Under-sampled models stay in their original slot.
+    Returns the updated TASK_ROUTES.
+    """
+    with _ema_lock:
+        for task, chain in list(TASK_ROUTES.items()):
+            task_scores = _ema_scores.get(task, {})
+            task_counts = _ema_counts.get(task, {})
+            mature = {m: s for m, s in task_scores.items()
+                      if task_counts.get(m, 0) >= _EMA_MIN_SAMPLES and m in chain}
+            if not mature:
+                continue
+            unsorted = [m for m in chain if m not in mature]
+            promoted = sorted(mature, key=lambda m: mature[m], reverse=True)
+            TASK_ROUTES[task] = promoted + unsorted
+            LOG.info("AutoTune promoted task=%s order=%s", task, TASK_ROUTES[task])
+    return dict(TASK_ROUTES)
+
+
+def autotune_status() -> dict[str, Any]:
+    """Return current EMA scores and sample counts for all (task, model) pairs."""
+    with _ema_lock:
+        return {
+            "alpha": _EMA_ALPHA,
+            "min_samples": _EMA_MIN_SAMPLES,
+            "ema_scores": {t: dict(m) for t, m in _ema_scores.items()},
+            "ema_counts": {t: dict(m) for t, m in _ema_counts.items()},
+        }
+
+
 # ── Skill-augmented context injection (Masterplan §1.2) ─────────────────────
 def build_skill_system_prompt(
     profile: dict[str, Any],
