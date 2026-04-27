@@ -644,4 +644,18 @@ def _finish(mission: RepoHunterReport, status_: str) -> dict[str, Any]:
         summary=f"[Side1] {mission.repo_url} → {status_} ({len(mission.findings)} findings)",
         metadata=mission.to_json(),
     )
+    # Playbook §4 — Autonomous Mission Debrief.
+    # Render an investor-ready Markdown narrative, save under /data/vault,
+    # and upload to Telegram / OpenClaw. Failures must never break the
+    # mission finish path.
+    try:
+        from embodied.pipelines.mission_debrief import emit_mission_debrief
+        debrief = emit_mission_debrief(mission, side="Side 1 — Repo Hunter")
+        if debrief.get("ok"):
+            mission.notes.append(
+                f"Debrief written: {debrief.get('report_path')} "
+                f"(uploaded → {debrief.get('upload', {}).get('channels', [])})"
+            )
+    except Exception as exc:  # noqa: BLE001
+        mission.notes.append(f"mission_debrief failed: {exc!r}")
     return mission.to_json()

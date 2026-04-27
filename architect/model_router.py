@@ -46,18 +46,25 @@ TIER3_PRIMARY = os.getenv("TIER3_PRIMARY_MODEL", "kimi-k2.5")                  #
 TIER4_PRIMARY = os.getenv("TIER4_PRIMARY_MODEL", "claude-4.6-sonnet")          # FALLBACK (OR-only)
 TIER5_LOCAL   = os.getenv("TIER5_LOCAL_MODEL",   "minimax-m2.5")               # FALLBACK_ALT (OR-only)
 
+# Playbook §3 — Secure JSON tool-calling fallback. When the primary
+# DO/OpenRouter provider fails on a code-heavy task, fall over to
+# kimi-k2.5 (TIER3_PRIMARY) instead of the previously hardcoded
+# llama3.3-70b-instruct, which is unreliable for strict JSON tool calls.
+JSON_TOOL_CALL_FALLBACK = TIER3_PRIMARY
+
 # Per-task → preferred model, with overflow chain.
 TASK_ROUTES: dict[str, list[str]] = {
     # Lightweight bulk work — T1-fast first, T5 local fallback.
     "recon":                  [TIER1_PRIMARY, TIER5_LOCAL],
     "bulk_triage":            [TIER5_LOCAL, TIER1_PRIMARY],
     "scope_parse":            [TIER1_PRIMARY, TIER5_LOCAL],
-    # Code-heavy reasoning — DeepSeek V3 deep tier.
-    "static_analysis":        [TIER1_DEEP, TIER1_PRIMARY, TIER2_PRIMARY],
-    "patch_generation":       [TIER1_DEEP, TIER1_PRIMARY],
+    # Code-heavy reasoning — DeepSeek V3 deep tier, then kimi for secure
+    # JSON tool-calling instead of the old llama-fallback (Playbook §3).
+    "static_analysis":        [TIER1_DEEP, JSON_TOOL_CALL_FALLBACK, TIER2_PRIMARY],
+    "patch_generation":       [TIER1_DEEP, JSON_TOOL_CALL_FALLBACK],
     # Logic chains and exploit graphs — Qwen3 MoE.
-    "exploit_reasoning":      [TIER2_PRIMARY, TIER1_DEEP, TIER4_PRIMARY],
-    "chain_synthesis":        [TIER2_PRIMARY, TIER1_DEEP],
+    "exploit_reasoning":      [TIER2_PRIMARY, JSON_TOOL_CALL_FALLBACK, TIER4_PRIMARY],
+    "chain_synthesis":        [TIER2_PRIMARY, JSON_TOOL_CALL_FALLBACK],
     # Long-context whole-repo work.
     "long_context_analysis":  [TIER3_PRIMARY, TIER1_PRIMARY],
     # ACTS 3-model consensus — distinct providers on purpose.
@@ -65,7 +72,7 @@ TASK_ROUTES: dict[str, list[str]] = {
     "adversarial_review_b":   [TIER1_DEEP],
     "adversarial_review_c":   [TIER2_PRIMARY],
     # Final-mile report polish — only model worth paying T4 for.
-    "report_drafting":        [TIER1_DEEP, TIER1_PRIMARY],
+    "report_drafting":        [TIER1_DEEP, JSON_TOOL_CALL_FALLBACK],
     "critical_cve_draft":     [TIER4_PRIMARY, TIER2_PRIMARY],
 }
 

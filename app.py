@@ -2777,4 +2777,29 @@ if __name__ == "__main__":
         except Exception as _e:  # noqa: BLE001
             print(f"[OPENCLAW] gateway not started: {_e}")
 
-    demo.launch(server_name="0.0.0.0", server_port=port, share=False, show_error=True)
+    # ── EmbodiedOS Headless Enforcement (Playbook §2) ─────────────────────
+    # When EMBODIED_LEGACY_UI=0, completely bypass the demo.launch() Gradio UI
+    # and rely on openclaw_gateway + unified_gateway.py to keep the process
+    # alive and listen for intents.
+    if os.getenv("EMBODIED_LEGACY_UI", "1") == "0":
+        print("[EMBODIED_OS] Gradio disabled. Running pure headless...")
+        try:
+            import unified_gateway as _ug
+            if hasattr(_ug, "start_in_background"):
+                _ug.start_in_background()
+                print("[EMBODIED_OS] unified_gateway armed.")
+            elif hasattr(_ug, "main"):
+                threading.Thread(target=_ug.main, daemon=True).start()
+                print("[EMBODIED_OS] unified_gateway thread started.")
+        except Exception as _e:  # noqa: BLE001
+            print(f"[EMBODIED_OS] unified_gateway not available: {_e}")
+        # Idle loop — keeps the process alive so OpenClaw / Telegram intents
+        # can drive the engine without any web UI. Webhook server, Mythos,
+        # NIGHT-HUNTER, ARCHITECT and OPENCLAW threads remain live.
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            print("[EMBODIED_OS] headless loop interrupted — shutting down.")
+    else:
+        demo.launch(server_name="0.0.0.0", server_port=port, share=False, show_error=True)

@@ -40,7 +40,18 @@ SOURCES_DEFAULT: list[str] = [
     "https://arxiv.org/list/cs.CR/recent",
     "https://googleprojectzero.blogspot.com/",
     "https://portswigger.net/research",
+    # ── EmbodiedOS SOTA intelligence feeds (Playbook §5) ────────────────
+    "https://github.com/swisskyrepo/PayloadsAllTheThings",
+    "https://github.com/projectdiscovery/nuclei-templates",
+    "https://github.com/carlospolop/hacktricks",
+    "https://github.com/google/security-research",
+    "https://github.com/JDArmy/Awesome-LLM-Security",
+    "https://www.hackthebox.com/cybersecurity-resources/cheatsheets",
+    "https://github.com/freypwn/HackTheBox-All-Cheatsheets",
 ]
+
+# Backwards-compat alias used by some callers (meta_learner_daemon).
+_DEFAULT_SOURCES = SOURCES_DEFAULT
 
 
 @dataclass

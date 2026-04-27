@@ -380,4 +380,15 @@ def _finish(mission: BountyHunterReport, status_: str) -> dict[str, Any]:
         summary=f"[Side2] {mission.platform}/{mission.program} → {status_} ({len(mission.findings)} findings)",
         metadata=mission.to_json(),
     )
+    # Playbook §4 — Autonomous Mission Debrief.
+    try:
+        from embodied.pipelines.mission_debrief import emit_mission_debrief
+        debrief = emit_mission_debrief(mission, side="Side 2 — Bounty Hunter")
+        if debrief.get("ok"):
+            mission.notes.append(
+                f"Debrief written: {debrief.get('report_path')} "
+                f"(uploaded → {debrief.get('upload', {}).get('channels', [])})"
+            )
+    except Exception as exc:  # noqa: BLE001
+        mission.notes.append(f"mission_debrief failed: {exc!r}")
     return mission.to_json()

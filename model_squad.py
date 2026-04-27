@@ -77,9 +77,12 @@ _DEFAULT_SQUAD: tuple[SquadModel, ...] = (
         role="EXECUTION",
         nickname="The Hands",
         do_id=os.getenv("EXECUTION_MODEL", "llama3.3-70b-instruct"),
+        # Playbook §3 — Replace the hardcoded llama3.3-70b-instruct OR
+        # fallback with kimi-k2.5 so secure JSON tool-calling continues
+        # to work when the DO primary fails.
         or_id=os.getenv(
             "EXECUTION_MODEL_OR",
-            "meta-llama/llama3.3-70b-instruct",
+            "moonshotai/kimi-k2.5",
         ),
         on_do=True,
         purpose="primary executor — code edits, fix generation, tool calls",

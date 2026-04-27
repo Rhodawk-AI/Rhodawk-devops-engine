@@ -406,10 +406,25 @@ class PythonRuntime(LanguageRuntime):
 
     def run_tests(self, test_path: str, repo_dir: str, env_config: EnvConfig, timeout: int = 120) -> tuple[str, int]:
         pytest_bin = env_config.test_runner_cmd[0]
-        return self._run(
+        output, code = self._run(
             [pytest_bin, test_path, "-v", "--tb=short"],
             cwd=repo_dir, timeout=timeout,
         )
+        # Playbook §1 — Pre-Flight Meta-Healing.
+        # Detect raw pytest collection errors (these never reach the fix
+        # loop because pytest exits 2 / 4 *before* running any test) and
+        # route them to Hermes for autonomous environment refactoring.
+        try:
+            err = detect_pytest_collection_error(output, returncode=code)
+            if err is not None:
+                route_collection_error_to_hermes(
+                    err=err,
+                    test_path=test_path,
+                    repo_dir=repo_dir,
+                )
+        except Exception:  # noqa: BLE001 — meta-healing must never break the loop
+            pass
+        return output, code
 
     def run_sast(self, diff_text: str, changed_files: list[str], repo_dir: str) -> RuntimeSastReport:
         # Delegate to existing sast_gate module to avoid duplication
@@ -1596,3 +1611,151 @@ class RuntimeFactory:
     @classmethod
     def supported_languages(cls) -> list[str]:
         return [r.language for r in cls._REGISTRY]
+
+
+# ──────────────────────────────────────────────────────────────
+# PRE-FLIGHT META-HEALING (Playbook §1)
+# ──────────────────────────────────────────────────────────────
+#
+# Pytest "collection errors" are raised *before* the fix loop ever sees a
+# real test failure. They look like:
+#
+#   ImportError while importing test module 'tests/test_foo.py'
+#   ERROR collecting tests/test_foo.py
+#       ModuleNotFoundError: No module named 'requests'
+#       __init__.py: cannot import name 'X' from 'Y'
+#
+# Routing these tracebacks straight to Hermes (with priority) lets the
+# brain refactor the affected test file or requirements.txt before the
+# logic-patching loop starts wasting iterations on a broken environment.
+
+_PYTEST_COLLECTION_PATTERNS = (
+    re.compile(r"ERROR collecting\s+(\S+)", re.IGNORECASE),
+    re.compile(r"ImportError while importing test module '([^']+)'"),
+    re.compile(r"ModuleNotFoundError:\s+No module named ['\"]([^'\"]+)['\"]"),
+    re.compile(r"E\s+ImportError:\s+cannot import name ['\"]([^'\"]+)['\"]"),
+    re.compile(r"^.*tests?/__init__\.py.*$", re.MULTILINE),
+    re.compile(r"INTERNALERROR>", re.MULTILINE),
+)
+
+# Pytest exit codes that indicate a *non-test* failure:
+#   2 = test collection failure
+#   3 = internal error
+#   4 = pytest usage error
+_PYTEST_PRECOLLECT_EXIT_CODES = {2, 3, 4}
+
+
+@dataclass
+class CollectionError:
+    """Structured pytest collection / pre-flight failure."""
+
+    kind: str                       # "import_error" | "missing_module" | "init_in_tests" | "internal_error"
+    raw_stderr: str                 # the full pytest stderr (capped at 4 KB)
+    affected_paths: list[str] = field(default_factory=list)
+    missing_modules: list[str] = field(default_factory=list)
+    returncode: int = 0
+
+
+def detect_pytest_collection_error(output: str, *, returncode: int) -> Optional["CollectionError"]:
+    """Inspect raw pytest stdout+stderr for a pre-test collection failure.
+
+    Returns ``None`` when the run is a plain test failure (exit 1) — those
+    are handled by the standard verification loop. Returns a structured
+    ``CollectionError`` otherwise so the caller can route it to Hermes.
+    """
+    if not output:
+        return None
+    text = output[-8000:]   # only inspect the last 8 KB
+    affected: list[str] = []
+    missing: list[str] = []
+    kind = "import_error"
+
+    for pat in _PYTEST_COLLECTION_PATTERNS:
+        for m in pat.finditer(text):
+            try:
+                grp = m.group(1)
+            except IndexError:
+                grp = ""
+            if not grp:
+                continue
+            if "No module named" in pat.pattern:
+                missing.append(grp)
+                kind = "missing_module"
+            elif "cannot import name" in pat.pattern:
+                missing.append(grp)
+                kind = "import_error"
+            elif "tests" in grp and grp.endswith("__init__.py"):
+                affected.append(grp)
+                kind = "init_in_tests"
+            elif "INTERNALERROR" in pat.pattern:
+                kind = "internal_error"
+            else:
+                affected.append(grp)
+
+    triggered = (
+        returncode in _PYTEST_PRECOLLECT_EXIT_CODES
+        or affected
+        or missing
+        or "INTERNALERROR" in text
+        or "ImportError while importing test module" in text
+    )
+    if not triggered:
+        return None
+
+    return CollectionError(
+        kind=kind,
+        raw_stderr=text[-4000:],
+        affected_paths=sorted(set(affected)),
+        missing_modules=sorted(set(missing)),
+        returncode=returncode,
+    )
+
+
+def route_collection_error_to_hermes(
+    *,
+    err: "CollectionError",
+    test_path: str,
+    repo_dir: str,
+) -> dict:
+    """Hand a pytest collection-error tracebackto Hermes with priority so it
+    can refactor the test file or ``requirements.txt`` *before* the main
+    logic-patching loop wastes iterations on a broken environment.
+
+    Returns a JSON-able status dict; never raises.
+    """
+    instruction = (
+        "PRE-FLIGHT META-HEALING — pytest cannot even *collect* the test "
+        f"file `{test_path}` in `{repo_dir}`.\n\n"
+        f"Failure kind:        {err.kind}\n"
+        f"Pytest exit code:    {err.returncode}\n"
+        f"Affected paths:      {', '.join(err.affected_paths) or 'n/a'}\n"
+        f"Missing modules:     {', '.join(err.missing_modules) or 'n/a'}\n\n"
+        "Raw pytest stderr (last 4 KB):\n"
+        "```\n" + err.raw_stderr + "\n```\n\n"
+        "PRIORITY: Refactor the offending test file (or requirements.txt) "
+        "so collection succeeds. Do NOT patch business logic yet — the main "
+        "verification loop will run after collection is clean."
+    )
+    try:
+        from embodied.bridge.hermes_client import HermesClient  # type: ignore
+        client = HermesClient()
+        session = client.open_session(mission=f"meta-heal:{test_path}")
+        sid = getattr(session, "session_id", "") if session else ""
+        result = client.run_task(
+            session_id=sid,
+            instruction=instruction,
+            max_iterations=4,
+        )
+        return {"ok": bool(result and result.get("ok")), "kind": err.kind, "result": result}
+    except Exception as exc:  # noqa: BLE001
+        # Best-effort fallback: write the traceback to /data/vault for
+        # operator visibility even if Hermes is unreachable.
+        try:
+            vault = Path("/data/vault")
+            vault.mkdir(parents=True, exist_ok=True)
+            (vault / "PRE_FLIGHT_META_HEAL.log").open("a", encoding="utf-8").write(
+                f"\n=== {test_path} ({err.kind}) ===\n{err.raw_stderr}\n"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": False, "kind": err.kind, "error": repr(exc)}

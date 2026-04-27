@@ -25,7 +25,11 @@ import os
 import time
 from dataclasses import dataclass, field
 from typing import Optional
-from language_runtime import RuntimeFactory
+from language_runtime import (
+    RuntimeFactory,
+    detect_pytest_collection_error,
+    route_collection_error_to_hermes,
+)
 
 MAX_RETRIES = int(os.getenv("RHODAWK_MAX_RETRIES", "5"))
 ADVERSARIAL_REJECTION_MULTIPLIER = int(os.getenv("RHODAWK_ADVERSARIAL_REJECTION_MULTIPLIER", "2"))
@@ -143,3 +147,66 @@ def build_initial_prompt(
     ))
 
     return "\n".join(sections)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# PRE-FLIGHT META-HEALING (Playbook §1)
+# ──────────────────────────────────────────────────────────────────────
+#
+# Before the main retry loop begins, run pytest once to capture the raw
+# stderr collection error (if any) and route it to Hermes with priority.
+# This stops the loop from burning iterations when the *environment* is
+# the problem (missing dependency, broken `tests/__init__.py`, etc.).
+
+def pre_flight_meta_heal(
+    test_path: str,
+    repo_dir: str = "/data/repo",
+    *,
+    timeout: int = 60,
+) -> dict:
+    """Run a single pytest collection to surface pre-flight failures.
+
+    Returns a status dict:
+        {"ok": True}                                 — collection clean
+        {"ok": False, "kind": ..., "result": ...}    — handed to Hermes
+        {"ok": False, "reason": "no_runtime"}        — runtime not available
+    """
+    try:
+        runtime = RuntimeFactory.for_repo(repo_dir)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": "runtime_init_failed", "error": repr(exc)}
+
+    if not hasattr(runtime, "setup_env") or not hasattr(runtime, "run_tests"):
+        return {"ok": False, "reason": "no_runtime"}
+
+    try:
+        env_config = runtime.setup_env(repo_dir)
+    except Exception as exc:  # noqa: BLE001
+        # setup_env itself failed — that's a meta-healing candidate too.
+        return route_collection_error_to_hermes(
+            err=type("E", (), {
+                "kind": "env_setup_failure",
+                "raw_stderr": repr(exc)[:4000],
+                "affected_paths": [],
+                "missing_modules": [],
+                "returncode": -1,
+            })(),
+            test_path=test_path,
+            repo_dir=repo_dir,
+        )
+
+    try:
+        output, code = runtime.run_tests(test_path, repo_dir, env_config, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": "run_tests_raised", "error": repr(exc)}
+
+    err = detect_pytest_collection_error(output, returncode=code)
+    if err is None:
+        return {"ok": True}
+
+    # Found a collection-level failure → hand to Hermes with priority.
+    return route_collection_error_to_hermes(
+        err=err,
+        test_path=test_path,
+        repo_dir=repo_dir,
+    )
