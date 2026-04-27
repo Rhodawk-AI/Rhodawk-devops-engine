@@ -618,6 +618,184 @@ class ReportGenerateTool(HermesTool):
         return out
 
 
+class BinaryExploitTool(HermesTool):
+    """Gap-4 wiring: Ghidra + angr + pwntools triage of a single binary.
+
+    Inputs (kwargs):
+      * ``binary_path`` (str, required) — absolute path to ELF/PE on disk.
+      * ``synthesize``  (bool, default False) — also emit a pwntools draft.
+
+    Returns the structured ``AnalysisReport`` as a dict, plus an optional
+    ``ValidationChallenge`` shape compatible with ``ExploitValidatorTool``.
+    """
+
+    name = "analyze_binary"
+    description = (
+        "Run Ghidra headless decompilation, then angr symbolic exploration "
+        "toward dangerous libc sinks, then pwntools-based crash repro. "
+        "Optionally synthesises a pwntools exploit draft and a "
+        "ValidationChallenge for the deterministic validator."
+    )
+
+    def run(self, **kwargs) -> dict:
+        from binary_exploit_engine import (
+            analyze_binary, synthesize_exploit, to_validation_challenge,
+        )
+        binary_path = kwargs.get("binary_path")
+        if not binary_path:
+            return {"error": "binary_path is required"}
+        report = analyze_binary(binary_path)
+        out: dict = report.to_dict()
+        if kwargs.get("synthesize"):
+            draft = synthesize_exploit(report)
+            out["exploit_draft"] = {
+                "target_binary": draft.target_binary,
+                "target_arch":   draft.target_arch,
+                "pwntools_src":  draft.pwntools_src,
+                "notes":         draft.notes,
+            }
+            challenge = to_validation_challenge(report)
+            if challenge:
+                out["validation_challenge"] = challenge
+        hermes_log(
+            f"Binary triage → {binary_path} sinks={len(report.sinks)} "
+            f"crashes={len(report.crashes)} confirmed={report.confirmed()}",
+            "BINARY",
+        )
+        return out
+
+
+class SBOMScanTool(HermesTool):
+    """Gap-7 wiring: SBOM generation + multi-engine SCA.
+
+    Runs syft → grype + osv-scanner + trivy in parallel and returns a
+    deduplicated finding list ranked by severity. CRITICAL/HIGH findings
+    are auto-promoted into the threat graph so the compliance reporter
+    sees them on the next ``generate_compliance_report`` call.
+
+    Inputs (kwargs):
+      * ``target`` (str, required) — directory path or container image ref.
+      * ``kind``   (str, default 'dir') — ``dir`` or ``image``.
+      * ``promote_to_graph`` (bool, default True).
+    """
+
+    name = "scan_sbom"
+    description = (
+        "Generate SBOM (syft) + run grype/osv-scanner/trivy in parallel. "
+        "Returns merged, deduplicated findings ranked by severity and "
+        "promotes CRITICAL/HIGH findings into the threat graph."
+    )
+
+    def run(self, **kwargs) -> dict:
+        from sbom_engine import run_full_sca, record_findings_to_threat_graph
+
+        target = kwargs.get("target")
+        if not target:
+            return {"error": "target is required"}
+        kind = kwargs.get("kind", "dir")
+        report = run_full_sca(target, kind=kind)
+        promoted = 0
+        if kwargs.get("promote_to_graph", True):
+            promoted = record_findings_to_threat_graph(report)
+        out = report.to_dict()
+        out["promoted_to_graph"] = promoted
+        hermes_log(
+            f"SBOM/SCA → target={target} kind={kind} "
+            f"findings={len(report.findings)} tools_run={report.tools_run}",
+            "SBOM",
+        )
+        return out
+
+
+class CICDPentestTool(HermesTool):
+    """Gap-9 wiring: nuclei + ffuf staging-environment gate.
+
+    Inputs (kwargs):
+      * ``target_url`` (str, required) — staging URL to scan.
+      * ``repo`` (str, optional) — repo identifier for the report.
+      * ``severity_threshold`` (str, default 'HIGH') — gate floor.
+      * ``promote_to_graph`` (bool, default True).
+    """
+
+    name = "cicd_pentest_gate"
+    description = (
+        "Run nuclei + ffuf against a staging URL as the last gate before "
+        "deployment. Returns PASS/FAIL/MANUAL plus the full finding list."
+    )
+
+    def run(self, **kwargs) -> dict:
+        from cicd_pentest_gate import (
+            run_pentest_gate, record_findings_to_threat_graph,
+        )
+        target_url = kwargs.get("target_url")
+        if not target_url:
+            return {"error": "target_url is required"}
+        report = run_pentest_gate(
+            target_url,
+            repo=kwargs.get("repo", ""),
+            severity_threshold=kwargs.get("severity_threshold", "HIGH"),
+        )
+        promoted = 0
+        if kwargs.get("promote_to_graph", True):
+            promoted = record_findings_to_threat_graph(report)
+        out = report.to_dict()
+        out["promoted_to_graph"] = promoted
+        hermes_log(
+            f"CI/CD gate → {target_url} decision={report.decision} "
+            f"findings={len(report.findings)} tools_run={report.tools_run}",
+            "CICD",
+        )
+        return out
+
+
+class OSSFuzzSubmitTool(HermesTool):
+    """Gap-15 wiring: build + (optionally) PR an OSS-Fuzz harness submission.
+
+    Inputs (kwargs):
+      * ``project_name``    (str, required)
+      * ``repo_url``        (str, required)
+      * ``primary_contact`` (str, required)
+      * ``harnesses``       (list[dict], required) — each ``{name, source}``.
+      * ``dry_run``         (bool, default True) — set False to open a PR
+        against ``google/oss-fuzz`` (requires OSS_FUZZ_GH_TOKEN +
+        OSS_FUZZ_FORK_OWNER).
+    """
+
+    name = "submit_oss_fuzz"
+    description = (
+        "Generate an OSS-Fuzz project layout (project.yaml + Dockerfile + "
+        "build.sh + harnesses) for a target repo, validate it, and "
+        "optionally open a pull request against google/oss-fuzz."
+    )
+
+    def run(self, **kwargs) -> dict:
+        from oss_fuzz_pipeline import build_submission, submit_to_oss_fuzz
+        required = ("project_name", "repo_url", "primary_contact", "harnesses")
+        missing = [k for k in required if not kwargs.get(k)]
+        if missing:
+            return {"error": f"missing required: {missing}"}
+        try:
+            sub = build_submission(
+                project_name=kwargs["project_name"],
+                repo_url=kwargs["repo_url"],
+                primary_contact=kwargs["primary_contact"],
+                harnesses=kwargs["harnesses"],
+                sanitizers=kwargs.get("sanitizers"),
+                fuzzing_engines=kwargs.get("fuzzing_engines"),
+                auto_ccs=kwargs.get("auto_ccs"),
+                notes=kwargs.get("notes", ""),
+            )
+            result = submit_to_oss_fuzz(sub, dry_run=bool(kwargs.get("dry_run", True)))
+        except Exception as exc:                                # noqa: BLE001
+            return {"error": str(exc)}
+        hermes_log(
+            f"OSS-Fuzz → project={kwargs['project_name']} "
+            f"status={result.get('status')} dry_run={kwargs.get('dry_run', True)}",
+            "OSSFUZZ",
+        )
+        return result
+
+
 _TOOL_REGISTRY: dict[str, HermesTool] = {
     t.name: t() for t in [
         ReconTool, TaintTool, SymbolicTool, FuzzTool,
@@ -626,6 +804,8 @@ _TOOL_REGISTRY: dict[str, HermesTool] = {
         SASTScanTool, CoverageGuidedFuzzTool,
         ExploitValidatorTool,
         ReportGenerateTool,
+        # ─── Phase 3: deep exploitation + CI/CD gates ───────────────
+        BinaryExploitTool, SBOMScanTool, CICDPentestTool, OSSFuzzSubmitTool,
     ]
 }
 

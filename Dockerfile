@@ -23,12 +23,95 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         nodejs npm \
         # ─── Gap 2 (Coverage-Guided Fuzzing): AFL++ + Clang/LLD/LLVM ──
         afl++ afl++-clang clang lld llvm \
+        # ─── Gap 4 (Binary Exploitation): Ghidra 11.x runtime deps ──
+        # OpenJDK is required by Ghidra's analyzeHeadless launcher.
+        openjdk-17-jre-headless \
         # ─── camofox-browser runtime deps ────────────────────────────
         xvfb libgtk-3-0 libdbus-glib-1-2 libxt6 libasound2 \
         libx11-xcb1 libxcomposite1 libxcursor1 libxdamage1 libxfixes3 \
         libxi6 libxrandr2 libxss1 libxtst6 libnss3 libpango-1.0-0 \
         libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libgbm1 \
     && rm -rf /var/lib/apt/lists/*
+
+# ─── Gap 4 (Binary Exploitation): Ghidra 11.x headless ───────────────────
+# Pinned release; the official ZIP unpacks into ghidra_<ver>_PUBLIC/ which
+# we symlink to /opt/ghidra so analyzeHeadless lives at a stable path.
+ARG GHIDRA_VERSION=11.1.2
+ARG GHIDRA_BUILD=20240709
+RUN curl -fsSL -o /tmp/ghidra.zip \
+      "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/ghidra_${GHIDRA_VERSION}_PUBLIC_${GHIDRA_BUILD}.zip" \
+ && unzip -q /tmp/ghidra.zip -d /opt \
+ && ln -sfn "/opt/ghidra_${GHIDRA_VERSION}_PUBLIC" /opt/ghidra \
+ && chmod -R a+rX /opt/ghidra/ \
+ && rm /tmp/ghidra.zip \
+ && mkdir -p /data/ghidra_projects /data/binary_reports \
+ && chmod -R a+rwX /data/ghidra_projects /data/binary_reports
+ENV GHIDRA_INSTALL_DIR=/opt/ghidra \
+    GHIDRA_HEADLESS=/opt/ghidra/support/analyzeHeadless \
+    GHIDRA_PROJECT_DIR=/data/ghidra_projects \
+    ANGR_TIMEOUT=600 \
+    BINARY_ENGINE_OUT=/data/binary_reports
+
+# ─── Gap 7 (SBOM / SCA): syft + grype + osv-scanner + trivy ──────────────
+# All four are statically-linked Go binaries pulled from official release
+# channels. Versions pinned for reproducibility; bump in sync with the
+# upstream advisories.
+ARG SYFT_VERSION=1.14.0
+ARG GRYPE_VERSION=0.79.6
+ARG OSV_VERSION=1.8.5
+ARG TRIVY_VERSION=0.55.2
+RUN set -eux; \
+    curl -fsSL "https://raw.githubusercontent.com/anchore/syft/main/install.sh"  | sh -s -- -b /usr/local/bin "v${SYFT_VERSION}";  \
+    curl -fsSL "https://raw.githubusercontent.com/anchore/grype/main/install.sh" | sh -s -- -b /usr/local/bin "v${GRYPE_VERSION}"; \
+    curl -fsSL -o /usr/local/bin/osv-scanner \
+      "https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/osv-scanner_linux_amd64"; \
+    chmod +x /usr/local/bin/osv-scanner; \
+    curl -fsSL -o /tmp/trivy.tgz \
+      "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"; \
+    tar -xzf /tmp/trivy.tgz -C /usr/local/bin trivy; \
+    rm /tmp/trivy.tgz; \
+    mkdir -p /data/sbom; \
+    chmod -R a+rwX /data/sbom
+ENV SYFT_BIN=/usr/local/bin/syft \
+    GRYPE_BIN=/usr/local/bin/grype \
+    OSV_BIN=/usr/local/bin/osv-scanner \
+    TRIVY_BIN=/usr/local/bin/trivy \
+    SCA_TIMEOUT=600 \
+    SBOM_OUT_DIR=/data/sbom
+
+# ─── Gap 9 (CI/CD Pentest Gate): nuclei + ffuf + nuclei-templates ────────
+ARG NUCLEI_VERSION=3.3.0
+ARG FFUF_VERSION=2.1.0
+RUN set -eux; \
+    curl -fsSL -o /tmp/nuclei.zip \
+      "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_amd64.zip"; \
+    unzip -q /tmp/nuclei.zip -d /tmp/nuclei && mv /tmp/nuclei/nuclei /usr/local/bin/nuclei; \
+    chmod +x /usr/local/bin/nuclei; \
+    rm -rf /tmp/nuclei /tmp/nuclei.zip; \
+    curl -fsSL -o /tmp/ffuf.tgz \
+      "https://github.com/ffuf/ffuf/releases/download/v${FFUF_VERSION}/ffuf_${FFUF_VERSION}_linux_amd64.tar.gz"; \
+    tar -xzf /tmp/ffuf.tgz -C /usr/local/bin ffuf; \
+    chmod +x /usr/local/bin/ffuf; \
+    rm /tmp/ffuf.tgz; \
+    git clone --depth=1 https://github.com/projectdiscovery/nuclei-templates.git /opt/nuclei-templates; \
+    mkdir -p /opt/wordlists /data/cicd_reports; \
+    curl -fsSL -o /opt/wordlists/common.txt \
+      https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt; \
+    chmod -R a+rX /opt/nuclei-templates /opt/wordlists; \
+    chmod -R a+rwX /data/cicd_reports
+ENV NUCLEI_BIN=/usr/local/bin/nuclei \
+    NUCLEI_TEMPLATES_DIR=/opt/nuclei-templates \
+    FFUF_BIN=/usr/local/bin/ffuf \
+    FFUF_WORDLIST=/opt/wordlists/common.txt \
+    CICD_PENTEST_TIMEOUT=600 \
+    CICD_REPORT_DIR=/data/cicd_reports
+
+# ─── Gap 15 (OSS-Fuzz pipeline) data dirs ────────────────────────────────
+RUN mkdir -p /data/oss_fuzz_submissions \
+ && chmod -R a+rwX /data/oss_fuzz_submissions
+ENV OSS_FUZZ_OUT_DIR=/data/oss_fuzz_submissions \
+    OSS_FUZZ_DB=/data/oss_fuzz_submissions.sqlite \
+    OSS_FUZZ_BASE_BRANCH=master
 
 # ─── Gap 1 (SAST Engine): CodeQL CLI + security query packs ──────────────
 RUN curl -fsSL -o /tmp/codeql.zip \

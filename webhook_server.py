@@ -245,6 +245,58 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
             self._send_json(202, {"status": "accepted", "repo": repo, "test": test_path})
 
+        elif path == "/webhook/cicd":
+            # Gap-9 wiring: pre-deploy DAST gate (nuclei + ffuf).
+            # CI/CD systems POST {repo, target_url, severity_threshold?}
+            # and receive a synchronous PASS/FAIL/MANUAL verdict so the
+            # pipeline can block promotion-to-production on any finding
+            # at-or-above the configured floor.
+            target_url = payload.get("target_url") or payload.get("url", "")
+            repo       = payload.get("repo") or payload.get("repository", "")
+            threshold  = (payload.get("severity_threshold")
+                          or os.getenv("CICD_GATE_THRESHOLD", "HIGH"))
+            if not target_url:
+                _log_webhook("cicd", payload, "REJECTED", "Missing 'target_url'")
+                self._send_json(400, {"error": "Missing 'target_url' field"})
+                return
+            try:
+                from cicd_pentest_gate import (
+                    run_pentest_gate, record_findings_to_threat_graph,
+                )
+            except Exception as exc:                       # noqa: BLE001
+                _log_webhook("cicd", payload, "ERROR", f"import failed: {exc}")
+                self._send_json(503, {
+                    "error": "cicd_pentest_gate unavailable",
+                    "detail": str(exc),
+                })
+                return
+
+            _log_webhook("cicd", payload, "ACCEPTED",
+                         f"Pentest gate for {target_url} (threshold={threshold})")
+            try:
+                report = run_pentest_gate(
+                    target_url, repo=repo, severity_threshold=threshold,
+                )
+                promoted = record_findings_to_threat_graph(report)
+            except Exception as exc:                       # noqa: BLE001
+                _log_webhook("cicd", payload, "ERROR", f"gate crashed: {exc}")
+                self._send_json(500, {"error": "gate execution failed",
+                                      "detail": str(exc)})
+                return
+
+            status_code = 200 if report.decision == "PASS" else 422
+            self._send_json(status_code, {
+                "decision":          report.decision,
+                "threshold":         report.threshold,
+                "summary":           report.summary,
+                "tools_run":         report.tools_run,
+                "tools_skipped":     report.tools_skipped,
+                "promoted_to_graph": promoted,
+                "wall_time_ms":      report.wall_time_ms,
+                "finding_count":     len(report.findings),
+                "error":             report.error,
+            })
+
         elif path == "/webhook/trigger":
             repo = payload.get("repo", os.getenv("GITHUB_REPO", ""))
             if _job_dispatcher:
