@@ -463,14 +463,110 @@ class CoverageGuidedFuzzTool(HermesTool):
         }
 
 
+class ExploitValidatorTool(HermesTool):
+    """Gap-3 wiring: Deterministic exploit validator (XBOW architecture).
+
+    Bridges the orchestrator to :mod:`exploit_validator`. Accepts either
+    a fully-formed ``ValidationChallenge`` payload (preferred) or a
+    legacy free-form ``candidate_poc`` dict that this tool will coerce
+    into a challenge. Returns a JSON-serialisable verdict dict.
+
+    The validator runs inside the sandbox configured via the
+    ``EXPLOIT_VALIDATOR_SANDBOX`` env var (docker | firejail | none).
+    """
+
+    name = "validate_exploit"
+    description = (
+        "Run exploit_validator against a candidate PoC (web or binary). "
+        "Returns a deterministic ValidationVerdict — CONFIRMED / REFUTED / "
+        "PARTIAL / ERROR — plus hashed evidence and wall time."
+    )
+
+    def run(self, **kwargs) -> dict:
+        from dataclasses import asdict as _asdict
+        from exploit_validator import (
+            ExploitValidator,
+            ValidationChallenge,
+            ValidationVerdict,
+        )
+
+        challenge_payload = kwargs.get("challenge")
+        if challenge_payload is None:
+            poc = kwargs.get("candidate_poc") or {}
+            challenge_payload = {
+                "challenge_id": poc.get("id") or poc.get("challenge_id")
+                                  or f"chal-{int(time.time()*1000)}",
+                "vuln_class":   poc.get("vuln_class") or poc.get("vuln_type") or "rce",
+                "exploit_code": poc.get("exploit_code") or poc.get("payload") or "",
+                "target_url":   poc.get("target_url"),
+                "target_binary": poc.get("target_binary"),
+                "expected_evidence": poc.get("expected_evidence", ""),
+                "timeout_seconds": int(
+                    poc.get("timeout_seconds")
+                    or os.getenv("EXPLOIT_VALIDATOR_TIMEOUT", "120")
+                ),
+                "max_memory_mb": int(
+                    poc.get("max_memory_mb")
+                    or os.getenv("EXPLOIT_VALIDATOR_MAX_MEMORY_MB", "256")
+                ),
+                "no_network_egress": bool(
+                    int(os.getenv("EXPLOIT_VALIDATOR_NO_NETWORK", "1"))
+                ),
+            }
+
+        if isinstance(challenge_payload, dict):
+            allowed = {
+                "challenge_id", "vuln_class", "exploit_code",
+                "target_url", "target_binary", "expected_evidence",
+                "timeout_seconds", "read_only",
+                "no_network_egress", "max_memory_mb",
+            }
+            challenge = ValidationChallenge(
+                **{k: v for k, v in challenge_payload.items() if k in allowed}
+            )
+        else:
+            challenge = challenge_payload
+
+        hermes_log(
+            f"Exploit validator → {challenge.vuln_class} "
+            f"({challenge.target_url or challenge.target_binary})",
+            "EXPLOIT",
+        )
+
+        sandbox = os.getenv("EXPLOIT_VALIDATOR_SANDBOX", "docker")
+        result = ExploitValidator().validate(challenge)
+        as_dict = _asdict(result)
+        as_dict["verdict"] = result.verdict.value if isinstance(
+            result.verdict, ValidationVerdict
+        ) else str(result.verdict)
+        as_dict["sandbox"] = sandbox
+        as_dict["confirmed"] = (as_dict["verdict"] == "CONFIRMED")
+        return as_dict
+
+
 _TOOL_REGISTRY: dict[str, HermesTool] = {
     t.name: t() for t in [
         ReconTool, TaintTool, SymbolicTool, FuzzTool,
         ExploitTool, CVETool, CommitWatchTool, SSECTool,
         ChainAnalyzerTool,
         SASTScanTool, CoverageGuidedFuzzTool,
+        ExploitValidatorTool,
     ]
 }
+
+
+def validate_exploit_via_tool(challenge_payload: dict) -> dict:
+    """Public helper for in-process callers (e.g. chain_analyzer.execute_chain).
+
+    Bypasses the LLM tool-call layer and dispatches directly through
+    :data:`_TOOL_REGISTRY` so we get the same verdict shape, env-var
+    sandbox routing, and audit log entry as a Hermes-driven invocation
+    — without spinning up a session.
+    """
+    tool = _TOOL_REGISTRY.get("validate_exploit")
+    if tool is None:                                    # pragma: no cover
+        return {"error": "validate_exploit tool not registered"}
+    return tool.run(challenge=challenge_payload)
 
 
 def _dispatch_tool(tool_name: str, args: dict, session: HermesSession) -> dict:

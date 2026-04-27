@@ -19,14 +19,43 @@ ENV DEBIAN_FRONTEND=noninteractive \
     UV_LINK_MODE=copy
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        git curl ca-certificates build-essential unzip xz-utils \
+        git curl wget ca-certificates build-essential unzip xz-utils \
         nodejs npm \
+        # ─── Gap 2 (Coverage-Guided Fuzzing): AFL++ + Clang/LLD/LLVM ──
+        afl++ afl++-clang clang lld llvm \
         # ─── camofox-browser runtime deps ────────────────────────────
         xvfb libgtk-3-0 libdbus-glib-1-2 libxt6 libasound2 \
         libx11-xcb1 libxcomposite1 libxcursor1 libxdamage1 libxfixes3 \
         libxi6 libxrandr2 libxss1 libxtst6 libnss3 libpango-1.0-0 \
         libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libgbm1 \
     && rm -rf /var/lib/apt/lists/*
+
+# ─── Gap 1 (SAST Engine): CodeQL CLI + security query packs ──────────────
+RUN curl -fsSL -o /tmp/codeql.zip \
+      https://github.com/github/codeql-cli-binaries/releases/latest/download/codeql-linux64.zip \
+ && unzip -q /tmp/codeql.zip -d /opt \
+ && rm /tmp/codeql.zip \
+ && /opt/codeql/codeql pack download \
+      codeql/python-queries \
+      codeql/javascript-queries \
+      codeql/java-queries \
+      codeql/cpp-queries \
+      codeql/go-queries \
+ && mkdir -p /data/codeql_dbs \
+ && chmod -R a+rX /opt/codeql /data/codeql_dbs
+ENV CODEQL_BIN=/opt/codeql/codeql \
+    SEMGREP_BIN=semgrep \
+    CODEQL_DB_DIR=/data/codeql_dbs \
+    SAST_TIMEOUT_SECONDS=600
+
+# ─── Gap 2 (Coverage-Guided Fuzzing): AFL++ env + corpus dirs ────────────
+RUN mkdir -p /data/fuzz_corpus /data/fuzz_findings \
+ && chmod -R a+rwX /data/fuzz_corpus /data/fuzz_findings
+ENV AFL_BIN=afl-fuzz \
+    AFL_CC=afl-clang-fast \
+    FUZZ_TIMEOUT_SECONDS=1800 \
+    FUZZ_CORPUS_DIR=/data/fuzz_corpus \
+    FUZZ_FINDINGS_DIR=/data/fuzz_findings
 
 # uv
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/

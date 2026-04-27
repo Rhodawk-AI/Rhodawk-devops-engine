@@ -360,3 +360,157 @@ def call_with_skills(
 
     return {"decision": decision, "system": system,
             "messages": messages, "response": response, "mode": mode}
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# GAP 16 — MODEL ALLOY (ENSEMBLE ROUTING)
+#
+# `route()` returns a single best-guess model per task. For high-stakes
+# vulnerability work we want an *ensemble*: race k diverse models and
+# pick a consensus answer (or the highest-scoring one). Two new helpers:
+#
+#   * alloy_route(task, k=3)   – returns up to k DISTINCT RouteDecisions
+#                                pulled from the task's fallback chain,
+#                                back-filled with diverse cross-task
+#                                providers when the chain is shorter
+#                                than k. Provider diversity is enforced
+#                                so the alloy never collapses to k copies
+#                                of the same vendor.
+#
+#   * consensus_route(task)    – orchestrator-friendly wrapper that
+#                                returns a structured plan: the "lead"
+#                                decision + the alloy + the voting
+#                                strategy the caller should apply
+#                                (majority | best-of-k | unanimous).
+#
+# Budget guardrail is preserved: if the hard cap is exhausted, the alloy
+# is replaced with k copies of TIER5_LOCAL so callers can still execute
+# (just without ensemble diversity).
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _provider_of(model: str) -> str:
+    """Best-effort vendor extraction from an OpenRouter model slug."""
+    if not model or "/" not in model:
+        return model or "unknown"
+    return model.split("/", 1)[0]
+
+
+def alloy_route(task: str, k: int = 3, *, prefer: str | None = None) -> list[RouteDecision]:
+    """Return up to ``k`` DISTINCT routing decisions for an ensemble race.
+
+    The first slot is the same model `route()` would pick (honors
+    ``prefer`` and the budget guardrail). Subsequent slots are chosen
+    from the task's declared fallback chain, then from a diverse cross-
+    task pool, skipping any model whose provider is already in the
+    alloy. This guarantees vendor diversity (e.g. anthropic + google +
+    openai) which is what makes the consensus signal meaningful.
+    """
+    if k < 1:
+        k = 1
+
+    chain = TASK_ROUTES.get(task, [TIER1_PRIMARY])
+    if prefer and prefer in chain:
+        chain = [prefer] + [m for m in chain if m != prefer]
+
+    cross_pool: list[str] = []
+    for other_task, other_chain in TASK_ROUTES.items():
+        if other_task == task:
+            continue
+        for m in other_chain:
+            if m not in cross_pool:
+                cross_pool.append(m)
+
+    over_budget = (_BUDGET.spent_usd >= _BUDGET.hard_cap_usd)
+
+    picks: list[str] = []
+    used_providers: set[str] = set()
+
+    def _try_add(model: str) -> None:
+        if model in picks:
+            return
+        prov = _provider_of(model)
+        if prov in used_providers and len(picks) < k:
+            return
+        picks.append(model)
+        used_providers.add(prov)
+
+    if over_budget:
+        picks = [TIER5_LOCAL] * k
+    else:
+        for m in chain:
+            _try_add(m)
+            if len(picks) >= k:
+                break
+        if len(picks) < k:
+            for m in cross_pool:
+                _try_add(m)
+                if len(picks) >= k:
+                    break
+        if len(picks) < k:
+            for m in cross_pool:
+                if m not in picks:
+                    picks.append(m)
+                if len(picks) >= k:
+                    break
+        if len(picks) < k:
+            picks.extend([TIER5_LOCAL] * (k - len(picks)))
+
+    decisions: list[RouteDecision] = []
+    for idx, model in enumerate(picks[:k]):
+        if over_budget:
+            reason = "budget-exceeded → local"
+        elif idx == 0:
+            reason = f"alloy-lead:{prefer or 'default'}"
+        else:
+            reason = f"alloy-slot{idx}:diverse-{_provider_of(model)}"
+        decisions.append(RouteDecision(
+            task=task, model=model, reason=reason,
+            fallback_chain=chain, tier=_tier_of(model),
+        ))
+    return decisions
+
+
+def consensus_route(task: str, k: int = 3, *,
+                    strategy: str = "majority",
+                    prefer: str | None = None) -> dict[str, Any]:
+    """Build a consensus execution plan for ``task``.
+
+    Returns a dict with:
+      ``lead``       – the primary RouteDecision (mirrors ``route(task)``)
+      ``alloy``      – the k-wide list of distinct RouteDecisions
+      ``strategy``   – one of ``majority`` | ``best_of_k`` | ``unanimous``
+      ``min_agree`` – minimum # of agreeing models for a "consensus" verdict
+      ``providers``  – vendor list for fast diversity inspection
+
+    The caller (e.g. ACTS, conviction_engine) executes each decision in
+    parallel, then applies ``strategy`` to the responses. This module
+    deliberately does NOT execute the LLM calls — that lives in the
+    orchestrator so we can keep `model_router` pure-stateless apart
+    from the budget singleton.
+    """
+    valid = {"majority", "best_of_k", "unanimous"}
+    if strategy not in valid:
+        strategy = "majority"
+
+    alloy = alloy_route(task, k=k, prefer=prefer)
+    lead  = alloy[0] if alloy else route(task, prefer=prefer)
+
+    if strategy == "unanimous":
+        min_agree = len(alloy)
+    elif strategy == "majority":
+        min_agree = (len(alloy) // 2) + 1
+    else:                                       # best_of_k
+        min_agree = 1
+
+    providers = [_provider_of(d.model) for d in alloy]
+    return {
+        "task":       task,
+        "lead":       lead,
+        "alloy":      alloy,
+        "strategy":   strategy,
+        "min_agree":  min_agree,
+        "providers":  providers,
+        "diverse":    len(set(providers)) == len(providers),
+        "budget":     budget_status(),
+    }

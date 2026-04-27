@@ -34,9 +34,14 @@ qdrant-client>=1.9.0
 transformers>=4.40.0
 torch>=2.2.0
 
-# atheris removed: requires Clang + libFuzzer at compile time which is
-# unavailable on HuggingFace Space Docker images. Fuzzing falls back to
-# Hypothesis automatically.
+# ─── Gap 2 (Coverage-Guided Fuzzing): Atheris re-enabled ────────────────
+# Previously removed because Clang + libFuzzer were unavailable. The
+# Dockerfile now installs `clang lld llvm afl++ afl++-clang` in the base
+# layer, so atheris can compile against libFuzzer. Pip install will use
+# the in-image Clang toolchain. If the host build still lacks Clang,
+# AFL++ remains available for compiled targets and the orchestrator
+# falls back to Hypothesis for pure-Python ones.
+atheris>=2.3.0
 angr>=9.2.0
 networkx>=3.0
 defusedxml>=0.7.1
