@@ -2742,6 +2742,42 @@ if __name__ == "__main__":
 
     threading.Thread(target=_prewarm, daemon=True).start()
 
+    # GAP 6 — Pre-warm the code-aware semantic embedder
+    # (nomic-ai/nomic-embed-code by default). Runs in a background thread so
+    # the multi-second model download never blocks the dashboard launch.
+    def _prewarm_semantic():
+        try:
+            from semantic_embedder import pre_warm as _se_warm, status as _se_status
+            ok = _se_warm()
+            st = _se_status()
+            ui_log(
+                f"Semantic embedder pre-warmed: model={st.get('model_id')} "
+                f"device={st.get('device')} dim={st.get('dim')}"
+                if ok else
+                "Semantic embedder pre-warm failed — will retry on first use.",
+                "EMBED",
+            )
+        except Exception as _e:                                # noqa: BLE001
+            ui_log(f"Semantic embedder pre-warm error (non-fatal): {_e}", "EMBED")
+
+    threading.Thread(target=_prewarm_semantic, daemon=True).start()
+
+    # GAP 5 — Eagerly load the MITRE ATT&CK STIX bundle so the first
+    # threat-graph lookup does not pay the parse cost on the request path.
+    def _prewarm_attck():
+        try:
+            from threat_graph import get_mapper
+            m = get_mapper()
+            m._load()                                          # noqa: SLF001
+            ui_log(
+                f"ATT&CK mapper ready: {m.technique_count} techniques loaded.",
+                "ATTCK",
+            )
+        except Exception as _e:                                # noqa: BLE001
+            ui_log(f"ATT&CK mapper pre-warm error (non-fatal): {_e}", "ATTCK")
+
+    threading.Thread(target=_prewarm_attck, daemon=True).start()
+
     ui_log("Starting webhook server on port 7861...")
     start_webhook_server()
     ui_log("Webhook server running. Launching dashboard...")

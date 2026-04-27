@@ -57,6 +57,23 @@ ENV AFL_BIN=afl-fuzz \
     FUZZ_CORPUS_DIR=/data/fuzz_corpus \
     FUZZ_FINDINGS_DIR=/data/fuzz_findings
 
+# ─── Gap 5 (Threat Graph): MITRE ATT&CK enterprise STIX 2.1 bundle ───────
+# Downloaded once at image build time so the runtime ATTCKMapper never
+# pays a network cost. Falls back to the built-in CWE → technique table
+# at runtime if the file is missing.
+RUN mkdir -p /opt/mitre \
+ && curl -fsSL -o /opt/mitre/enterprise-attack.json \
+      https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json \
+ && chmod -R a+rX /opt/mitre
+ENV MITRE_ATTCK_JSON=/opt/mitre/enterprise-attack.json
+
+# ─── Gap 6 (Semantic Embedder) + Gap 10 (Compliance) data dirs ───────────
+RUN mkdir -p /data/embed_cache /data/compliance_reports \
+ && chmod -R a+rwX /data/embed_cache /data/compliance_reports
+ENV RHODAWK_EMBED_CACHE_DIR=/data/embed_cache \
+    RHODAWK_REPORT_DIR=/data/compliance_reports \
+    RHODAWK_THREAT_GRAPH_DB=/data/threat_graph.sqlite
+
 # uv
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 

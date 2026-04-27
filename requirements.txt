@@ -34,6 +34,14 @@ qdrant-client>=1.9.0
 transformers>=4.40.0
 torch>=2.2.0
 
+# ─── Gap 6 (Semantic Embedder): nomic-ai/nomic-embed-code support ────────
+# nomic-embed-code is loaded via sentence-transformers (already pinned
+# above at >=2.7.0) with `trust_remote_code=True`. The `einops` package
+# is required by nomic's custom modeling code; `nomic` itself is
+# optional but useful for direct API access if HuggingFace is blocked.
+einops>=0.7.0
+nomic>=3.0.0
+
 # ─── Gap 2 (Coverage-Guided Fuzzing): Atheris re-enabled ────────────────
 # Previously removed because Clang + libFuzzer were unavailable. The
 # Dockerfile now installs `clang lld llvm afl++ afl++-clang` in the base

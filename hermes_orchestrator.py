@@ -544,6 +544,80 @@ class ExploitValidatorTool(HermesTool):
         return as_dict
 
 
+class ReportGenerateTool(HermesTool):
+    """Gap-10 wiring: Compliance report generator.
+
+    Aggregates a list of findings (provided by the orchestrator or pulled
+    from the threat graph for a given repo) into an auditor-ready report
+    mapped to OWASP Top-10, SOC 2, PCI DSS, ISO 27001, and NIST CSF.
+    Returns the JSON view inline plus on-disk paths for the JSON / Markdown
+    / HTML renderings written under ``RHODAWK_REPORT_DIR``.
+
+    Inputs (via ``kwargs``):
+      * ``repo``       (str, required)   — repository identifier
+      * ``findings``   (list[dict], optional) — explicit finding list. When
+        omitted, the tool pulls all findings for ``repo`` out of the
+        threat-graph DB.
+      * ``notes``      (str, optional)   — free-text notes appended to the
+        report's footer.
+      * ``write_disk`` (bool, default True) — when False, only the inline
+        JSON dict is returned.
+    """
+
+    name = "generate_compliance_report"
+    description = (
+        "Build a compliance report (OWASP/SOC2/PCI/ISO27001/NIST CSF) "
+        "from current findings + ATT&CK coverage. Renders JSON, Markdown, "
+        "and HTML to disk under RHODAWK_REPORT_DIR."
+    )
+
+    def run(self, **kwargs) -> dict:
+        from report_generator import build_report, write_report
+
+        repo = kwargs.get("repo") or ""
+        if not repo:
+            return {"error": "repo is required"}
+
+        findings = kwargs.get("findings")
+        if findings is None:
+            try:
+                from threat_graph import get_db
+                with get_db()._conn() as c:                       # noqa: SLF001
+                    rows = c.execute(
+                        "SELECT * FROM findings WHERE repo=?", (repo,),
+                    ).fetchall()
+                findings = [dict(r) for r in rows]
+            except Exception as exc:                              # noqa: BLE001
+                return {"error": f"could not load findings: {exc}"}
+
+        notes      = kwargs.get("notes", "")
+        write_disk = bool(kwargs.get("write_disk", True))
+
+        hermes_log(
+            f"Compliance report → repo={repo} findings={len(findings)}",
+            "REPORT",
+        )
+
+        report = build_report(repo, findings, notes=notes)
+        out: dict = {
+            "repo":           report.repo,
+            "generated_at":   report.generated_at,
+            "summary":        report.summary,
+            "by_framework":   report.by_framework,
+            "attck_coverage": report.attck_coverage,
+            "finding_count":  len(report.findings),
+            "unmapped_count": len(report.unmapped),
+        }
+        if write_disk:
+            out_dir = os.getenv("RHODAWK_REPORT_DIR", "/data/compliance_reports")
+            try:
+                paths = write_report(report, out_dir)
+                out["files"] = paths
+            except Exception as exc:                              # noqa: BLE001
+                out["files_error"] = str(exc)
+        return out
+
+
 _TOOL_REGISTRY: dict[str, HermesTool] = {
     t.name: t() for t in [
         ReconTool, TaintTool, SymbolicTool, FuzzTool,
@@ -551,6 +625,7 @@ _TOOL_REGISTRY: dict[str, HermesTool] = {
         ChainAnalyzerTool,
         SASTScanTool, CoverageGuidedFuzzTool,
         ExploitValidatorTool,
+        ReportGenerateTool,
     ]
 }
 
