@@ -152,6 +152,19 @@ def chat(role: str, messages: list[dict], *, json_mode: bool = True,
     )
 
 
+# ── Gap 14 (Observability): wrap `chat` with OTel + Langfuse hooks ──────
+# INV-030: every span/event is non-blocking. observability.py wraps the
+# decorated callable in try/except so a missing exporter or down collector
+# can NEVER break an LLM call. We rebind the public `chat` symbol so all
+# existing callers (hermes_orchestrator, conviction_engine, ACTS, etc.)
+# pick up the instrumentation transparently.
+try:
+    from observability import instrument_llm_router as _instrument_llm_router
+    chat = _instrument_llm_router(chat)  # type: ignore[assignment]
+except Exception as _exc:  # noqa: BLE001
+    LOG.debug("observability.instrument_llm_router unavailable: %s", _exc)
+
+
 def chat_text(role: str, messages: list[dict], **kwargs) -> str:
     """Convenience wrapper that returns just the assistant's text content."""
     kwargs.setdefault("json_mode", False)

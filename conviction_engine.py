@@ -26,13 +26,25 @@ merge the PR directly (no human required).
 Enable with: RHODAWK_AUTO_MERGE=true
 """
 
+import logging
 import os
 import time
-from typing import Optional
+from typing import Any, Optional
 
 import requests
 
 from exploit_validator import ValidationResult, ValidationVerdict
+
+LOG = logging.getLogger("rhodawk.conviction")
+
+# ── Gap 12 (SOAR Playbook Engine) ────────────────────────────────────────
+# Every finding that reaches the conviction gate is also handed to the
+# SOAR engine (INV-027 — append-only execution log). The dispatch is
+# best-effort: a SOAR misconfiguration must NEVER block auto-merge.
+try:
+    from soar_engine import get_default_engine as _soar_engine
+except Exception as _exc:  # noqa: BLE001
+    _soar_engine = None  # type: ignore[assignment]
 
 CONVICTION_CONFIDENCE_MIN = float(os.getenv("RHODAWK_CONVICTION_CONFIDENCE", "0.92"))
 CONVICTION_CONSENSUS_MIN  = float(os.getenv("RHODAWK_CONVICTION_CONSENSUS", "0.85"))
@@ -123,6 +135,60 @@ def evaluate_conviction(
         f"(confidence={confidence:.3f}, consensus={consensus_fraction:.3f}, "
         f"memory_sim={best_memory_sim:.3f}{validation_note})"
     )
+
+
+def process_finding(
+    finding: Any,
+    adversarial_review: dict,
+    similar_fixes: list[dict],
+    test_attempts: int,
+    sast_findings_count: int,
+    new_packages: list[str],
+    validation_result: Optional[ValidationResult] = None,
+) -> dict[str, Any]:
+    """End-to-end conviction + SOAR pass for a single finding.
+
+    Pipeline:
+      1. ``evaluate_conviction(...)`` — same gate as before.
+      2. ``SOAREngine.process_finding(finding)`` — fan out every YAML
+         playbook whose trigger matches. Append-only logged (INV-027).
+      3. Returned dict carries the conviction verdict + the list of
+         playbook runs so callers can surface them in the dashboard.
+
+    The SOAR step is wrapped in ``try/except`` and never blocks the
+    auto-merge decision: a broken playbook directory must not stop a
+    high-confidence fix from shipping.
+    """
+    should_merge, reason = evaluate_conviction(
+        adversarial_review=adversarial_review,
+        similar_fixes=similar_fixes,
+        test_attempts=test_attempts,
+        sast_findings_count=sast_findings_count,
+        new_packages=new_packages,
+        validation_result=validation_result,
+    )
+
+    soar_runs: list[dict[str, Any]] = []
+    if _soar_engine is not None:
+        try:
+            engine = _soar_engine()
+            for run in engine.process_finding(finding):
+                soar_runs.append({
+                    "playbook": run.playbook,
+                    "ok": run.ok,
+                    "started_at": run.started_at,
+                    "finished_at": run.finished_at,
+                    "step_count": len(run.steps),
+                    "failed_steps": [s.kind for s in run.steps if not s.ok],
+                })
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("SOAR dispatch failed for finding: %s", exc)
+
+    return {
+        "should_auto_merge": should_merge,
+        "reason": reason,
+        "soar_runs": soar_runs,
+    }
 
 
 def auto_merge_pr(

@@ -514,3 +514,214 @@ def consensus_route(task: str, k: int = 3, *,
         "diverse":    len(set(providers)) == len(providers),
         "budget":     budget_status(),
     }
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# GAP 16 — COST-BUDGET ENFORCEMENT (ModelAlloyRouter)
+#
+# `route()` and `alloy_route()` honour the budget by silently falling back
+# to TIER5_LOCAL once the hard cap is exceeded. That covers passive cost
+# defence but does NOT enforce the *active* defences the masterplan
+# requires:
+#
+#   1. Tool-call loop limit per session — runaway agent loops are the
+#      single biggest source of unbounded cost.
+#   2. Early-stop heuristic (INV-028) — once enough evidence has been
+#      collected to draft a finding, additional LLM calls are rejected
+#      and the session is forced to wrap up.
+#   3. A hard alias for the free fallback model — `ALLOY_FREE` — that the
+#      rest of the engine can import without knowing which DO/local id
+#      we currently route "free" to.
+#
+# `ModelAlloyRouter.get_model()` is the single entry point new code
+# should use:  it consults `should_early_stop()` first, returns
+# `ALLOY_FREE` when the budget is blown OR the tool-call budget is
+# exhausted, and otherwise delegates to `route()`.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+# Stable alias the rest of the engine imports. Always points at the
+# zero-cost local tier so callers don't have to know about TIER5_LOCAL.
+ALLOY_FREE = TIER5_LOCAL
+
+DEFAULT_MAX_TOOL_CALLS = int(os.getenv("ARCHITECT_MAX_TOOL_CALLS", "60"))
+DEFAULT_MIN_FINDINGS_FOR_EARLY_STOP = int(
+    os.getenv("ARCHITECT_EARLY_STOP_MIN_FINDINGS", "3")
+)
+
+
+@dataclass
+class _SessionUsage:
+    tool_calls: int = 0
+    llm_calls: int = 0
+    findings: int = 0
+    started_at: float = field(default_factory=time.time)
+
+
+class ModelAlloyRouter:
+    """Per-session model alloy with active cost-budget enforcement.
+
+    A single instance is created per research session (one Hermes loop,
+    one ACTS race, etc.).  All in-loop routing decisions go through
+    :meth:`get_model`, which:
+
+      * Calls :meth:`should_early_stop` first.  If it returns ``True``
+        the router returns :data:`ALLOY_FREE` (TIER5_LOCAL) regardless
+        of the task's preferred chain.  This gives the orchestrator a
+        cheap, no-op-friendly model to use for the final wrap-up turn
+        instead of crashing or burning premium tokens on dead-end work.
+      * Otherwise consults :func:`route` — preserving the existing
+        per-task chain, EMA promotion, and provider-diversity logic.
+
+    The router keeps lightweight per-session counters that callers must
+    update via :meth:`record_tool_call`, :meth:`record_llm_call`, and
+    :meth:`record_finding`.  The global ``_BUDGET`` singleton continues
+    to track cross-session $ spend (hard cap enforced regardless).
+    """
+
+    def __init__(
+        self,
+        *,
+        max_tool_calls: int | None = None,
+        min_findings_for_early_stop: int | None = None,
+    ):
+        self.max_tool_calls = max_tool_calls or DEFAULT_MAX_TOOL_CALLS
+        self.min_findings_for_early_stop = (
+            min_findings_for_early_stop
+            if min_findings_for_early_stop is not None
+            else DEFAULT_MIN_FINDINGS_FOR_EARLY_STOP
+        )
+        self._usage = _SessionUsage()
+        self._early_stopped = False
+        self._lock = _threading.Lock()
+
+    # ── counters ────────────────────────────────────────────────────
+
+    def record_tool_call(self, n: int = 1) -> None:
+        with self._lock:
+            self._usage.tool_calls += n
+
+    def record_llm_call(self, n: int = 1) -> None:
+        with self._lock:
+            self._usage.llm_calls += n
+
+    def record_finding(self, n: int = 1) -> None:
+        with self._lock:
+            self._usage.findings += n
+
+    def usage(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "tool_calls": self._usage.tool_calls,
+                "llm_calls": self._usage.llm_calls,
+                "findings": self._usage.findings,
+                "uptime_s": int(time.time() - self._usage.started_at),
+                "budget": budget_status(),
+                "early_stopped": self._early_stopped,
+            }
+
+    # ── INV-028 enforcement ─────────────────────────────────────────
+
+    def should_early_stop(self) -> tuple[bool, str]:
+        """Return ``(stop, reason)``.
+
+        Reasons (in priority order):
+          * dollar budget blown      — global cap exceeded
+          * tool-call cap reached    — runaway loop guard
+          * enough findings already  — INV-028 evidence saturation
+        """
+        if _BUDGET.spent_usd >= _BUDGET.hard_cap_usd:
+            return True, (
+                f"hard $ budget blown "
+                f"(${_BUDGET.spent_usd:.2f} >= ${_BUDGET.hard_cap_usd:.2f})"
+            )
+        with self._lock:
+            if self._usage.tool_calls >= self.max_tool_calls:
+                return True, (
+                    f"tool-call cap reached "
+                    f"({self._usage.tool_calls} >= {self.max_tool_calls})"
+                )
+            if (
+                self.min_findings_for_early_stop > 0
+                and self._usage.findings >= self.min_findings_for_early_stop
+                and self._usage.tool_calls
+                >= self.min_findings_for_early_stop * 4
+            ):
+                return True, (
+                    f"INV-028 evidence saturation "
+                    f"({self._usage.findings} findings in "
+                    f"{self._usage.tool_calls} tool calls)"
+                )
+        return False, ""
+
+    # ── primary API ────────────────────────────────────────────────
+
+    def get_model(
+        self,
+        task: str,
+        *,
+        prefer: str | None = None,
+    ) -> RouteDecision:
+        """Pick the right model for ``task`` with active budget enforcement.
+
+        On early-stop, returns a synthetic :class:`RouteDecision` whose
+        ``model`` is :data:`ALLOY_FREE` and whose ``reason`` carries the
+        early-stop diagnostic.  Callers may inspect ``.reason`` to
+        decide whether to also break out of their loop.
+        """
+        stop, reason = self.should_early_stop()
+        if stop:
+            self._early_stopped = True
+            LOG.warning("ModelAlloyRouter early-stop on task=%s: %s", task, reason)
+            return RouteDecision(
+                task=task,
+                model=ALLOY_FREE,
+                reason=f"early-stop: {reason}",
+                fallback_chain=[ALLOY_FREE],
+                tier=_tier_of(ALLOY_FREE),
+            )
+        return route(task, prefer=prefer)
+
+    def get_alloy(
+        self,
+        task: str,
+        k: int = 3,
+        *,
+        prefer: str | None = None,
+    ) -> list[RouteDecision]:
+        """Like :meth:`get_model` but returns a k-wide alloy."""
+        stop, reason = self.should_early_stop()
+        if stop:
+            self._early_stopped = True
+            LOG.warning(
+                "ModelAlloyRouter early-stop on alloy task=%s: %s", task, reason
+            )
+            return [
+                RouteDecision(
+                    task=task,
+                    model=ALLOY_FREE,
+                    reason=f"early-stop: {reason}",
+                    fallback_chain=[ALLOY_FREE],
+                    tier=_tier_of(ALLOY_FREE),
+                )
+            ] * max(1, k)
+        return alloy_route(task, k=k, prefer=prefer)
+
+
+__all__ = [
+    "RouteDecision",
+    "route",
+    "alloy_route",
+    "consensus_route",
+    "record_usage",
+    "reset_budget",
+    "budget_status",
+    "all_routes",
+    "build_skill_system_prompt",
+    "call_with_skills",
+    "autotune_record",
+    "autotune_promote",
+    "autotune_status",
+    "ModelAlloyRouter",
+    "ALLOY_FREE",
+]

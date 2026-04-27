@@ -180,6 +180,18 @@ _current_target_repo: str = ""
 # ──────────────────────────────────────────────────────────────
 initialize_store()
 
+# ── Gap 8 (eBPF Runtime Telemetry): start the Falco sensor ───────────────
+# `start_falco_sensor()` spins a daemon thread that tails $FALCO_LOG_PATH
+# (default /var/log/falco/falco.log), parses each event, and routes it to
+# the threat graph + SOAR engine. Safe at startup: if Falco isn't
+# installed, the sensor logs a warning and exits. Disabled entirely when
+# RHODAWK_TELEMETRY_ENABLED=false.
+try:
+    from telemetry_ingest import start_falco_sensor as _start_falco_sensor
+    _start_falco_sensor()
+except Exception as _exc:  # noqa: BLE001
+    print(f"[startup] Falco telemetry unavailable: {_exc}")
+
 # ──────────────────────────────────────────────────────────────
 # GLOBAL STATE
 # ──────────────────────────────────────────────────────────────

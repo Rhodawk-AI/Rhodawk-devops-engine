@@ -19,10 +19,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
     UV_LINK_MODE=copy
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        git curl wget ca-certificates build-essential unzip xz-utils \
+        git curl wget gnupg ca-certificates build-essential unzip xz-utils \
         nodejs npm \
         # ─── Gap 2 (Coverage-Guided Fuzzing): AFL++ + Clang/LLD/LLVM ──
         afl++ afl++-clang clang lld llvm \
+        # ─── Gap 3 (Exploit Validator): nsjail strong sandbox ─────────
+        # Without nsjail, exploit_validator silently degrades to a weak
+        # `subprocess` jail that can't enforce CPU/RLIMIT/network isolation.
+        nsjail \
         # ─── Gap 4 (Binary Exploitation): Ghidra 11.x runtime deps ──
         # OpenJDK is required by Ghidra's analyzeHeadless launcher.
         openjdk-17-jre-headless \
@@ -169,6 +173,33 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
                 mcp-server-fetch mcp-server-git mcp-server-sqlite \
                 grpcio==1.66.* grpcio-tools==1.66.* protobuf==5.*
+
+# ─── Gap 6 (Semantic Embedder): pre-pull nomic-embed-code weights ─────────
+# Bake the model weights into the image so the first runtime call doesn't
+# pay a 300+ MB cold-start download (and so air-gapped deployments work).
+# `trust_remote_code=True` is required because nomic ships custom modeling
+# code alongside the weights. Output is cached under
+# /home/rhodawk/.cache/huggingface (root → moved later when the user is
+# created).
+RUN python3 -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('nomic-ai/nomic-embed-code', trust_remote_code=True)"
+
+# ─── Gap 8 (eBPF Runtime Telemetry): Falco kernel-module + userspace ─────
+# Falco runs as the host (or sidecar) sensor; the engine tails its JSON log
+# via telemetry_ingest.FalcoTelemetry. Kernel headers are required for the
+# legacy kernel-module driver; modern deployments will switch to the
+# eBPF/CO-RE driver at runtime via FALCO_DRIVER=ebpf.
+RUN curl -fsSL https://falco.org/repo/falcosecurity-packages.asc \
+      | gpg --dearmor -o /usr/share/keyrings/falco-archive-keyring.gpg \
+ && echo "deb [signed-by=/usr/share/keyrings/falco-archive-keyring.gpg] https://download.falco.org/packages/deb stable main" \
+      > /etc/apt/sources.list.d/falcosecurity.list \
+ && apt-get update -y \
+ && apt-get install -y --no-install-recommends linux-headers-amd64 falco \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /var/log/falco /data/telemetry \
+ && chmod -R a+rwX /var/log/falco /data/telemetry
+ENV FALCO_LOG_PATH=/var/log/falco/falco.log \
+    FALCO_DRIVER=ebpf \
+    RHODAWK_TELEMETRY_ENABLED=true
 
 # Global MCP servers (npm)
 RUN npm install -g --quiet \

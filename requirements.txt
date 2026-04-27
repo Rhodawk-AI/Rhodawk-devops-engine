@@ -74,3 +74,16 @@ dnspython>=2.6.0
 #  in environments that bypass the Dockerfile.)
 grpcio>=1.66.0,<2.0.0
 protobuf>=5.0.0,<6.0.0
+
+# ─── Gap 12 (SOAR Playbook Engine): YAML playbook loader ────────────────
+PyYAML>=6.0
+
+# ─── Gap 14 (Observability): OpenTelemetry + Langfuse ───────────────────
+# OTel SDK provides the tracer + batch span processor; the OTLP/gRPC
+# exporter ships spans to a collector (default OTEL_EXPORTER_OTLP_ENDPOINT).
+# Langfuse layers per-LLM-call generation events on top — required for
+# cost attribution + prompt replay. INV-030: telemetry MUST NOT block
+# LLM calls; observability.py wraps every span in try/except.
+opentelemetry-sdk>=1.25.0
+opentelemetry-exporter-otlp-proto-grpc>=1.25.0
+langfuse>=2.40.0

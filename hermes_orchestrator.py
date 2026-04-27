@@ -39,6 +39,38 @@ from typing import Any, Callable, Optional
 
 import requests
 
+# ── Gap 6: semantic embedder for context retrieval ───────────────────────
+# `_embed_fn` is the canonical sentence-encoder entry point. Pulled in at
+# module load time so the runtime cost is the model warm-up, not the
+# import. The hermes loop calls it once per session to embed the focus
+# area + recent finding titles, producing the SSEC neighbour pack injected
+# into the system prompt.
+try:
+    from semantic_embedder import embed as _embed_fn  # noqa: F401
+except Exception as _exc:  # noqa: BLE001
+    _embed_fn = None  # type: ignore[assignment]
+
+# ── Gap 11 + 14: meta-coordinator + observability spans ──────────────────
+try:
+    from meta_agent import MetaCoordinator  # type: ignore
+except Exception:  # noqa: BLE001
+    MetaCoordinator = None  # type: ignore[assignment]
+
+try:
+    from observability import (  # type: ignore
+        trace_span as _trace_span,
+        instrument_tool_dispatch as _instrument_tool_dispatch,
+    )
+except Exception:  # noqa: BLE001
+    import contextlib as _contextlib
+
+    @_contextlib.contextmanager
+    def _trace_span(name, attrs=None):  # type: ignore
+        yield None
+
+    def _instrument_tool_dispatch(fn):  # type: ignore
+        return fn
+
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 # Default Hermes model is now the DigitalOcean model id (DO is PRIMARY).
 # When the request is routed to OpenRouter, hermes_orchestrator transparently
@@ -1137,6 +1169,38 @@ def run_hermes_research(
     log(f"Session {session_id} started → {target_repo}")
     log(f"Model: {HERMES_MODEL} | Max iterations: {max_iterations}")
 
+    # ── Gap 11 (XBOW MetaCoordinator): persistent coordinator + stateless
+    # sub-agents. Each tool dispatch goes through `coord.spawn_agent_for_tool`
+    # which guarantees no context accumulates between tool calls (INV-025).
+    coord = None
+    if MetaCoordinator is not None:
+        try:
+            coord = MetaCoordinator(_dispatch_tool)
+            log("MetaCoordinator armed — stateless sub-agents per tool call (INV-025)", "HERMES")
+        except Exception as exc:  # noqa: BLE001
+            log(f"MetaCoordinator init failed — falling back to direct dispatch: {exc}", "WARN")
+            coord = None
+
+    # ── Gap 6 (Semantic Embedder): pre-compute a focus-area embedding so
+    # the SSEC neighbour-pack helper can score candidate sinks without
+    # paying the model warm-up cost on every tool call.
+    session.focus_embedding = None  # type: ignore[attr-defined]
+    if _embed_fn is not None:
+        try:
+            with _trace_span("hermes.embed.focus", {"session.id": session_id}):
+                seed_text = (focus_area or f"security audit of {target_repo}").strip()
+                vec = _embed_fn([seed_text])
+                if vec:
+                    session.focus_embedding = vec[0]  # type: ignore[attr-defined]
+                    log(
+                        f"Focus-area embedding computed (dim={len(session.focus_embedding)})",
+                        "SSEC",
+                    )
+        except Exception as exc:  # noqa: BLE001
+            log(f"semantic_embedder warm-up failed: {exc}", "WARN")
+    else:
+        log("semantic_embedder unavailable — SSEC retrieval disabled this session", "WARN")
+
     # ── Masterplan §5: semantic skill injection ──────────────────────────
     skill_pack = ""
     try:
@@ -1238,7 +1302,26 @@ def run_hermes_research(
             log(f"Reasoning: {thought[:200]}", "HERMES")
 
         tool_args["repo_dir"] = repo_dir
-        tool_result = _dispatch_tool(tool_name, tool_args, session)
+
+        # ── Gap 11 + 14: stateless sub-agent + observability span ──────
+        with _trace_span(
+            "hermes.iter.tool",
+            {"tool.name": tool_name, "session.id": session_id, "phase": session.phase.value},
+        ):
+            if coord is not None:
+                _meta = {
+                    "session_id": session_id,
+                    "repo_dir": repo_dir,
+                    "phase": session.phase.value,
+                }
+                _agent_result = coord.spawn_agent_for_tool(tool_name, tool_args, _meta)
+                tool_result = (
+                    _agent_result.result
+                    if _agent_result.ok
+                    else {"error": _agent_result.error or "sub-agent failed"}
+                )
+            else:
+                tool_result = _dispatch_tool(tool_name, tool_args, session)
 
         if tool_name == "recon" and isinstance(tool_result, dict):
             session.attack_surface = tool_result
