@@ -288,11 +288,187 @@ class ChainAnalyzerTool(HermesTool):
         return {"chains": chains, "primitive_count": len(primitives)}
 
 
+def _hermes_fast_text(prompt: str) -> str:
+    """Synchronous text-completion helper for QRS / harness generation.
+
+    Uses the FAST Hermes model and returns the assistant message
+    content as plain text. Failure-tolerant — empty string on any
+    LLM transport error so QRS / harness loops never raise.
+    """
+    try:
+        out = _hermes_llm_call(
+            messages=[{"role": "user", "content": prompt}],
+            model=HERMES_FAST_MODEL,
+            timeout=120,
+        )
+    except Exception as exc:  # noqa: BLE001
+        hermes_log(f"_hermes_fast_text failed: {exc}", "HERMES")
+        return ""
+    if isinstance(out, dict):
+        # _hermes_llm_call may return a parsed JSON dict; re-stringify
+        # for callers that want raw text (CodeQL queries / Semgrep YAML).
+        for key in ("content", "text", "response"):
+            if key in out and isinstance(out[key], str):
+                return out[key]
+        return json.dumps(out)
+    return str(out or "")
+
+
+class SASTScanTool(HermesTool):
+    """Gap-1 wiring: CodeQL + Semgrep + QRS feedback loop.
+
+    Replaces the regex-only SAST path with the new
+    :class:`sast_orchestrator.SASTOrchestrator`. Top-N CRITICAL/HIGH
+    findings trigger LLM-driven QRS query synthesis to expand
+    coverage with custom CodeQL queries and Semgrep rules.
+    """
+
+    name = "sast_scan"
+    description = (
+        "Cross-file dataflow / taint SAST via CodeQL + Semgrep with "
+        "QRS query/rule synthesis from high-severity findings."
+    )
+
+    QRS_EXPANSION_BUDGET: int = 5
+
+    def run(
+        self,
+        repo_dir: str,
+        language: str = "python",
+        repo_name: str = "unknown",
+        codeql_db_path: Optional[str] = None,
+        **kwargs,
+    ) -> dict:
+        hermes_log(f"SAST scan → {repo_name} ({language})", "STATIC")
+        from sast_orchestrator import SASTOrchestrator
+        from dataclasses import asdict as _asdict
+
+        orchestrator = SASTOrchestrator()
+        results = orchestrator.full_scan(repo_dir, language, repo_name)
+
+        # QRS expansion for high-confidence findings.
+        high_severity = [r for r in results if r.severity in ("critical", "high")]
+        for finding in high_severity[: self.QRS_EXPANSION_BUDGET]:
+            try:
+                expanded = orchestrator.synthesize_and_scan(
+                    repo_dir,
+                    language,
+                    codeql_db_path,
+                    finding.message,
+                    finding.path_steps[:3] if finding.path_steps else finding.message,
+                    _hermes_fast_text,
+                )
+            except Exception as exc:  # noqa: BLE001
+                hermes_log(f"QRS expansion failed for {finding.rule_id}: {exc}", "STATIC")
+                continue
+            results.extend(expanded)
+
+        # Deduplicate again across the original + QRS-expanded result set.
+        results = SASTOrchestrator._deduplicate(results)
+        return {
+            "findings":      [_asdict(r) for r in results],
+            "count":         len(results),
+            "high_severity": sum(1 for r in results if r.severity in ("critical", "high")),
+            "qrs_runs":      min(len(high_severity), self.QRS_EXPANSION_BUDGET),
+        }
+
+
+class CoverageGuidedFuzzTool(HermesTool):
+    """Gap-2 wiring: AFL++ for compiled C/C++/Go targets + Atheris for Python.
+
+    Falls back to the legacy ``fuzzing_engine.run_fuzzing_campaign`` path
+    when the language isn't supported by the new engines or the required
+    binaries (afl-fuzz / atheris) are unavailable.
+    """
+
+    name = "coverage_fuzz"
+    description = (
+        "Coverage-guided fuzzing via AFL++ (C/C++/Go) or Atheris (Python). "
+        "Returns triaged crash findings deduplicated by stack hash."
+    )
+
+    def run(
+        self,
+        repo_dir: str,
+        target: str,
+        language: str = "python",
+        duration_s: int = 1800,
+        build_cmd: str = "make -j4",
+        target_module: str = "",
+        target_fn: str = "",
+        repo_name: str = "",
+        **kwargs,
+    ) -> dict:
+        from dataclasses import asdict as _asdict
+        from fuzz_orchestrator import FuzzOrchestrator
+
+        hermes_log(
+            f"Coverage fuzz → {target} ({language}, {duration_s}s)",
+            "DYNAMIC",
+        )
+        orchestrator = FuzzOrchestrator()
+        target_name = repo_name or target or "unknown_target"
+        lang = (language or "python").lower()
+
+        try:
+            if lang in FuzzOrchestrator.COMPILED_LANGS:
+                result = orchestrator.fuzz_compiled(
+                    repo_dir=repo_dir,
+                    build_cmd=build_cmd,
+                    target_name=target_name,
+                    timeout=duration_s,
+                )
+            elif lang == "python":
+                result = orchestrator.fuzz_python(
+                    target_module=target_module or target,
+                    target_fn=target_fn or target,
+                    target_name=target_name,
+                    llm_fn=_hermes_fast_text,
+                    timeout=duration_s,
+                )
+            else:
+                # Languages we have no coverage-guided engine for — defer.
+                from fuzzing_engine import run_fuzzing_campaign
+                return run_fuzzing_campaign(
+                    repo_dir, target, language=language, duration_s=duration_s,
+                )
+        except FileNotFoundError as exc:
+            hermes_log(f"coverage fuzz engine missing: {exc} — falling back", "DYNAMIC")
+            from fuzzing_engine import run_fuzzing_campaign
+            return run_fuzzing_campaign(
+                repo_dir, target, language=language, duration_s=duration_s,
+            )
+
+        return {
+            "target":          result.target,
+            "duration_s":      result.duration_seconds,
+            "unique_paths":    result.unique_paths,
+            "execs_per_sec":   result.execs_per_sec,
+            "coverage_edges":  result.coverage_edges,
+            "crashes":         [
+                {
+                    "target":         c.target,
+                    "crash_type":     c.crash_type,
+                    "stack_hash":     c.stack_hash,
+                    "stack_trace":    c.stack_trace,
+                    "asan_report":    c.asan_report[:4096],
+                    "severity":       c.severity,
+                    "reproducer_cmd": c.reproducer_cmd,
+                    "cwe_candidate":  c.cwe_candidate,
+                    "crash_input_b64": __import__("base64").b64encode(c.crash_input).decode("ascii"),
+                }
+                for c in result.crashes
+            ],
+            "crash_count":     len(result.crashes),
+        }
+
+
 _TOOL_REGISTRY: dict[str, HermesTool] = {
     t.name: t() for t in [
         ReconTool, TaintTool, SymbolicTool, FuzzTool,
         ExploitTool, CVETool, CommitWatchTool, SSECTool,
         ChainAnalyzerTool,
+        SASTScanTool, CoverageGuidedFuzzTool,
     ]
 }
 

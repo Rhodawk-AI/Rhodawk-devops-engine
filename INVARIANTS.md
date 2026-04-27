@@ -141,3 +141,38 @@ preserved for internal service-to-service use only and must not
 be exposed on the public network interface.
 
 *Enforced in:* `app.py` launch gate, Dockerfile port exposure policy
+
+---
+
+## INV-020: Deterministic Exploit Validator Gates All Findings
+
+**No finding with severity CRITICAL or HIGH may be surfaced to the
+operator without `ValidationVerdict.CONFIRMED` from
+`exploit_validator.py`.**
+
+LLM adversarial review is *advisory only* for CRITICAL / HIGH severity
+findings. The deterministic exploit validator — which never calls an LLM —
+is the sole authority for promoting a finding to operator-visible status.
+Verdicts of `REFUTED`, `PARTIAL`, or `SANDBOX_ERROR` send the finding
+back to the synthesiser for re-attempt.
+
+*Enforced in:* `exploit_validator.ExploitValidator.validate`,
+`conviction_engine.evaluate_conviction` (criterion 8)
+
+---
+
+## INV-021: SAST Runs Before Every PR Merge
+
+**`sast_orchestrator.full_scan()` must complete without BLOCK-severity
+findings before `conviction_engine` evaluates a fix for auto-merge.**
+
+The CodeQL + Semgrep + QRS pipeline replaces the regex / Bandit-only
+SAST path. The orchestrator's `full_scan` runs Semgrep first (no build
+required) and then CodeQL (deep cross-file dataflow); QRS then
+synthesises new queries / rules from the top high-severity findings to
+expand coverage. Auto-merge cannot proceed while any CRITICAL / HIGH
+finding remains in the diff.
+
+*Enforced in:* `sast_orchestrator.SASTOrchestrator`,
+`hermes_orchestrator.SASTScanTool`,
+`conviction_engine.evaluate_conviction` (criterion 6)

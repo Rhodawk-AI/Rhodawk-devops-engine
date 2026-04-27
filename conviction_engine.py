@@ -13,6 +13,12 @@ Conviction criteria (all must be met):
   5. test_attempts == 1 (fixed on first try — indicates clean, well-understood fix)
   6. SAST findings == 0 (zero informational findings on the diff)
   7. No new packages introduced in the diff
+  8. Deterministic exploit validator returned ValidationVerdict.CONFIRMED
+     (INV-020). When ``validation_result`` is provided and the verdict is
+     anything other than CONFIRMED, conviction is denied. When it is
+     ``None`` the criterion is *advisory* — applicable only to MEDIUM/LOW
+     findings where no validator challenge could be synthesised. Callers
+     gating CRITICAL/HIGH findings MUST pass a non-``None`` result.
 
 When all criteria pass, auto_merge() is called which uses the GitHub API to
 merge the PR directly (no human required).
@@ -22,7 +28,11 @@ Enable with: RHODAWK_AUTO_MERGE=true
 
 import os
 import time
+from typing import Optional
+
 import requests
+
+from exploit_validator import ValidationResult, ValidationVerdict
 
 CONVICTION_CONFIDENCE_MIN = float(os.getenv("RHODAWK_CONVICTION_CONFIDENCE", "0.92"))
 CONVICTION_CONSENSUS_MIN  = float(os.getenv("RHODAWK_CONVICTION_CONSENSUS", "0.85"))
@@ -36,10 +46,20 @@ def evaluate_conviction(
     test_attempts: int,
     sast_findings_count: int,
     new_packages: list[str],
+    validation_result: Optional[ValidationResult] = None,
 ) -> tuple[bool, str]:
     """
     Returns (should_auto_merge, reason_string).
     All criteria must pass for auto-merge to be approved.
+
+    Criterion 8 (INV-020 — deterministic exploit validation):
+        ``validation_result`` is the verdict from ``exploit_validator.py``.
+        When provided, only ``ValidationVerdict.CONFIRMED`` permits
+        auto-merge — every other verdict (REFUTED / PARTIAL / SANDBOX_ERROR)
+        denies it. Callers gating CRITICAL/HIGH severity findings MUST
+        pass a non-``None`` result; passing ``None`` skips the check
+        and is intended only for MEDIUM/LOW findings where no validator
+        challenge could be synthesised.
     """
     if not AUTO_MERGE_ENABLED:
         return False, "auto-merge disabled (RHODAWK_AUTO_MERGE != true)"
@@ -78,15 +98,30 @@ def evaluate_conviction(
         f"(best found: {best_memory_sim:.3f})"
     ))
 
+    # Criterion 8 — INV-020 deterministic exploit validation gate.
+    if validation_result is not None:
+        confirmed = validation_result.verdict == ValidationVerdict.CONFIRMED
+        evidence_excerpt = (validation_result.evidence or "")[:200]
+        checks.append((
+            confirmed,
+            f"INV-020 exploit validation verdict {validation_result.verdict.value} "
+            f"(challenge {validation_result.challenge_id}): {evidence_excerpt}",
+        ))
+
     failed = [(passed, reason) for passed, reason in checks if not passed]
     if failed:
         reasons = "; ".join(r for _, r in failed)
         return False, f"conviction not met: {reasons}"
 
+    validation_note = (
+        f", validation={validation_result.verdict.value}"
+        if validation_result is not None
+        else ""
+    )
     return True, (
         f"all {len(checks)} conviction criteria passed "
         f"(confidence={confidence:.3f}, consensus={consensus_fraction:.3f}, "
-        f"memory_sim={best_memory_sim:.3f})"
+        f"memory_sim={best_memory_sim:.3f}{validation_note})"
     )
 
 
