@@ -40,17 +40,20 @@ LOG = logging.getLogger("architect.model_router")
 # Defaults follow the Model Squad: cheap DO catalog ids first, OR-only
 # emergency models on the higher tiers. Override any of these via env.
 TIER1_PRIMARY = os.getenv("TIER1_PRIMARY_MODEL", "qwen3-32b")                  # TRIAGE
-TIER1_DEEP    = os.getenv("TIER1_DEEP_MODEL",    "llama3.3-70b-instruct")     # EXECUTION
+TIER1_DEEP    = os.getenv("TIER1_DEEP_MODEL",    "qwen3-32b")                  # EXECUTION (DO-native)
 TIER2_PRIMARY = os.getenv("TIER2_PRIMARY_MODEL", "deepseek-r1-distill-llama-70b")  # HERMES
-TIER3_PRIMARY = os.getenv("TIER3_PRIMARY_MODEL", "kimi-k2.5")                  # RECON (OR-only)
+TIER3_PRIMARY = os.getenv("TIER3_PRIMARY_MODEL", "kimi-k2.5")                  # RECON (OR-only reader)
 TIER4_PRIMARY = os.getenv("TIER4_PRIMARY_MODEL", "claude-4.6-sonnet")          # FALLBACK (OR-only)
 TIER5_LOCAL   = os.getenv("TIER5_LOCAL_MODEL",   "minimax-m2.5")               # FALLBACK_ALT (OR-only)
 
-# Playbook §3 — Secure JSON tool-calling fallback. When the primary
-# DO/OpenRouter provider fails on a code-heavy task, fall over to
-# kimi-k2.5 (TIER3_PRIMARY) instead of the previously hardcoded
-# llama3.3-70b-instruct, which is unreliable for strict JSON tool calls.
-JSON_TOOL_CALL_FALLBACK = TIER3_PRIMARY
+# CORRECTION (Apr 2026) — DigitalOcean Inference is the strict deployment
+# target. The previous fallback to TIER3_PRIMARY (kimi-k2.5) is invalid
+# because kimi is OR-only and would crash the DO endpoint when the
+# primary fails on a code-heavy task. The fallback now points at
+# qwen3-32b (TIER1_PRIMARY), which is natively hosted by DO and excels
+# at strict JSON tool-calling. deepseek-r1-distill-llama-70b
+# (TIER2_PRIMARY) is the next-best DO-native alternative.
+JSON_TOOL_CALL_FALLBACK = TIER1_PRIMARY
 
 # Per-task → preferred model, with overflow chain.
 TASK_ROUTES: dict[str, list[str]] = {

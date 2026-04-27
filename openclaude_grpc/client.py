@@ -47,6 +47,39 @@ DEFAULT_PORT_DO = int(os.getenv("OPENCLAUDE_GRPC_PORT_DO", "50051"))
 DEFAULT_PORT_OR = int(os.getenv("OPENCLAUDE_GRPC_PORT_OR", "50052"))
 DEFAULT_TIMEOUT = int(os.getenv("OPENCLAUDE_TIMEOUT", "600"))
 
+# CORRECTION (Apr 2026) — DigitalOcean Inference is the strict deployment
+# target. The DO daemon must always receive a DO-hosted model slug; the
+# previous llama3.3-70b-instruct / kimi-k2.5 defaults were OR-only or
+# unreliable for strict JSON tool-calls. qwen3-32b is the canonical
+# DO-native default; deepseek-r1-distill-llama-70b is the secondary
+# option. Set DO_INFERENCE_MODEL in .env to override.
+_DO_NATIVE_DEFAULT = "qwen3-32b"
+
+
+def _resolve_do_model(explicit: str = "") -> str:
+    """Return the DigitalOcean model slug, honouring DO_INFERENCE_MODEL.
+
+    Order of precedence:
+      1. ``explicit`` argument (if non-empty).
+      2. ``DO_INFERENCE_MODEL`` env var.
+      3. ``EXECUTION_MODEL`` env var (legacy alias).
+      4. ``_DO_NATIVE_DEFAULT`` (qwen3-32b).
+    """
+    return (
+        (explicit or "").strip()
+        or os.getenv("DO_INFERENCE_MODEL", "").strip()
+        or os.getenv("EXECUTION_MODEL", "").strip()
+        or _DO_NATIVE_DEFAULT
+    )
+
+
+def _resolve_do_api_key() -> str:
+    """Return the DigitalOcean Inference API key from .env."""
+    return (
+        os.getenv("DO_INFERENCE_API_KEY", "").strip()
+        or os.getenv("DIGITALOCEAN_INFERENCE_KEY", "").strip()
+    )
+
 
 class OpenClaudeError(RuntimeError):
     """Raised for unrecoverable client-side errors (connect, decode, etc)."""
@@ -298,9 +331,26 @@ def run_openclaude(
 
     full_prompt = _format_prompt(prompt, context_files)
 
+    # CORRECTION (Apr 2026) — Resolve the DigitalOcean primary model from
+    # DO_INFERENCE_MODEL (with qwen3-32b fallback) so we never accidentally
+    # ship an OR-only slug like moonshotai/kimi-k2.5 to the DO daemon.
+    resolved_primary_model = _resolve_do_model(primary_model)
+    resolved_do_api_key    = _resolve_do_api_key()
+    if log_fn and resolved_primary_model != (primary_model or ""):
+        log_fn(
+            f"OpenClaude DO model resolved → {resolved_primary_model}",
+            "INFO",
+        )
+    if not resolved_do_api_key and log_fn:
+        log_fn(
+            "DO_INFERENCE_API_KEY is empty — DigitalOcean primary will be "
+            "skipped at the daemon (start_daemon refuses without a key).",
+            "WARN",
+        )
+
     chain: list[tuple[int, str, str]] = []
     if primary_port:
-        chain.append((primary_port, primary_label, primary_model))
+        chain.append((primary_port, primary_label, resolved_primary_model))
     if fallback_port and fallback_port != primary_port:
         chain.append((fallback_port, fallback_label, fallback_model))
 

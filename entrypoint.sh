@@ -125,17 +125,28 @@ start_openclaw_gateway() {
 start_camofox
 
 # 2. OpenClaude gRPC daemons (do / or)
-export EXECUTION_MODEL="${EXECUTION_MODEL:-llama3.3-70b-instruct}"
+#
+# CORRECTION (Apr 2026) — DigitalOcean Inference is the strict deployment
+# target. EXECUTION defaults to qwen3-32b (DO-native, excels at strict
+# JSON tool-calling). The legacy llama3.3-70b-instruct / kimi-k2.5
+# defaults were OR-only or unreliable and would crash the DO endpoint.
+export EXECUTION_MODEL="${EXECUTION_MODEL:-qwen3-32b}"
 export HERMES_MODEL="${HERMES_MODEL:-deepseek-r1-distill-llama-70b}"
-export RECON_MODEL="${RECON_MODEL:-kimi-k2.5}"
+export RECON_MODEL="${RECON_MODEL:-kimi-k2.5}"          # OR-only reader (not used by DO daemon)
 export TRIAGE_MODEL="${TRIAGE_MODEL:-qwen3-32b}"
 export FALLBACK_MODEL="${FALLBACK_MODEL:-claude-4.6-sonnet}"
 export FALLBACK_MODEL_ALT="${FALLBACK_MODEL_ALT:-minimax-m2.5}"
 
+# DO daemon strictly honours DO_INFERENCE_MODEL / DO_INFERENCE_API_KEY
+# from .env, falling back to the DO-native qwen3-32b default — never
+# Kimi or Llama. If DO_INFERENCE_API_KEY is empty the daemon is skipped
+# inside start_daemon().
 DO_BASE="${DO_INFERENCE_BASE_URL:-https://inference.do-ai.run/v1}"
-DO_MODEL="${DO_INFERENCE_MODEL:-${EXECUTION_MODEL}}"
+DO_MODEL="${DO_INFERENCE_MODEL:-qwen3-32b}"
+export DO_INFERENCE_MODEL="${DO_MODEL}"
+export DO_INFERENCE_API_KEY="${DO_INFERENCE_API_KEY:-${DIGITALOCEAN_INFERENCE_KEY:-}}"
 start_daemon "do" 50051 "${DO_BASE}" \
-    "${DO_INFERENCE_API_KEY:-${DIGITALOCEAN_INFERENCE_KEY:-}}" \
+    "${DO_INFERENCE_API_KEY}" \
     "${DO_MODEL}"
 
 OR_BASE="${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}"

@@ -7,9 +7,9 @@ IDs held as a graceful FALLBACK.
 
 The squad (operator-facing names → role keys → model IDs)
 
-    1. The Hands       (EXECUTION)  llama3.3-70b-instruct
+    1. The Hands       (EXECUTION)  qwen3-32b
     2. The Brain       (HERMES)     deepseek-r1-distill-llama-70b
-    3. The Reader      (RECON)      kimi-k2.5
+    3. The Reader      (RECON)      kimi-k2.5  (OR-only, optional reader)
     4. The Screener    (TRIAGE)     qwen3-32b
     5. The Safety Net  (FALLBACK)   claude-4.6-sonnet  /  minimax-m2.5
 
@@ -76,14 +76,15 @@ _DEFAULT_SQUAD: tuple[SquadModel, ...] = (
     SquadModel(
         role="EXECUTION",
         nickname="The Hands",
-        do_id=os.getenv("EXECUTION_MODEL", "llama3.3-70b-instruct"),
-        # Playbook §3 — Replace the hardcoded llama3.3-70b-instruct OR
-        # fallback with kimi-k2.5 so secure JSON tool-calling continues
-        # to work when the DO primary fails.
-        or_id=os.getenv(
-            "EXECUTION_MODEL_OR",
-            "moonshotai/kimi-k2.5",
-        ),
+        # CORRECTION (Apr 2026) — DigitalOcean Inference is the strict
+        # deployment target. The previous llama3.3-70b-instruct primary
+        # plus moonshotai/kimi-k2.5 fallback combination is invalid:
+        # kimi-k2.5 is OR-only and crashes the DO endpoint, and
+        # llama3.3-70b-instruct is unreliable for strict JSON tool-calls.
+        # qwen3-32b is natively hosted by DO and excels at structured
+        # JSON tool-calling, so OpenClaude always receives a valid slug.
+        do_id=os.getenv("EXECUTION_MODEL", "qwen3-32b"),
+        or_id=os.getenv("EXECUTION_MODEL_OR", "qwen/qwen3-32b"),
         on_do=True,
         purpose="primary executor — code edits, fix generation, tool calls",
     ),
