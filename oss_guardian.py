@@ -57,8 +57,13 @@ def _detect_runtime(repo_path: str):
 
 
 def _hermes_attack(repo_path: str, language: str):
+    # run_hermes_research requires both target_repo (the URL/identifier
+    # used for session bookkeeping) and repo_dir (the on-disk path the
+    # tools actually read from). For the OSS-Guardian path the sandbox
+    # gives us a single local path that serves both purposes.
     from hermes_orchestrator import run_hermes_research
     return run_hermes_research(target_repo=repo_path,
+                               repo_dir=repo_path,
                                focus_area=f"oss-guardian:{language}",
                                max_iterations=6)
 
@@ -133,6 +138,7 @@ class OSSGuardian:
             from hermes_orchestrator import run_hermes_research
             session = run_hermes_research(
                 target_repo=repo_path,
+                repo_dir=repo_path,
                 focus_area="oss-guardian:fix-failing-tests",
                 max_iterations=3,
             )
