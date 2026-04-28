@@ -73,25 +73,73 @@ def register(name: str, pattern: str, *, help: str = "") -> Callable[[Callable],
 @register(
     "scan_repo",
     r"^\s*(?:scan(?:\s+repo)?|audit)\s+(?P<target>\S+)",
-    help="scan <repo-url-or-org/name> — queue an OSS Guardian scan",
+    help="scan <repo-url-or-org/name> — Blue Team only (tests + patch loop, NO red team)",
 )
 def _scan_repo(m: re.Match[str]) -> dict[str, Any]:
+    """Default scan — Blue Team only. The patch loop runs but the red team
+    stays gated; the operator must send /redteam <repo> to authorize an
+    offensive run (Condition B in the OSSGuardian state machine)."""
     target = m.group("target").strip()
     try:
         from oss_guardian import OSSGuardian
-        camp = OSSGuardian().run(target)
+        camp = OSSGuardian(redteam_authorized=False).run(target)
+        reply = (
+            f"Scan complete for {target}.\n"
+            f"  mode={camp.mode}\n"
+            f"  test_status={camp.test_status}\n"
+            f"  patch_attempts={camp.patch_attempts}/{__import__('oss_guardian').MAX_PATCH_RETRIES}\n"
+            f"  redteam_invoked={camp.redteam_invoked}\n"
+            f"  findings={len(camp.findings)}"
+        )
         return {
             "ok": True,
             "intent": "scan_repo",
-            "reply": f"Scan queued for {target}. Mode={camp.mode}, "
-                     f"findings={len(camp.findings)}.",
+            "reply": reply,
             "data": {"repo": target, "mode": camp.mode,
+                     "test_status": camp.test_status,
+                     "patch_attempts": camp.patch_attempts,
+                     "redteam_invoked": camp.redteam_invoked,
                      "findings": len(camp.findings)},
         }
     except Exception as exc:  # noqa: BLE001
         LOG.exception("scan_repo failed: %s", exc)
         return {"ok": False, "intent": "scan_repo",
                 "reply": f"Scan failed: {exc}", "data": None}
+
+
+@register(
+    "redteam",
+    r"^\s*/?red[\s_-]?team\s+(?P<target>\S+)",
+    help="redteam <repo-url> — explicit red-team authorization (Condition B)",
+)
+def _redteam(m: re.Match[str]) -> dict[str, Any]:
+    """Operator-authorized offensive run.
+    Sets ``redteam_authorized=True`` AND ``attack_only=True`` so OSSGuardian
+    skips the Blue Team patch loop and goes straight to Hermes attack mode.
+    This is the ONLY way to get the system into red team mode without first
+    exhausting the patch loop on a real test failure (Condition A)."""
+    target = m.group("target").strip()
+    try:
+        from oss_guardian import OSSGuardian
+        camp = OSSGuardian(redteam_authorized=True, attack_only=True).run(target)
+        reply = (
+            f"Red team run authorized for {target}.\n"
+            f"  mode={camp.mode}\n"
+            f"  redteam_invoked={camp.redteam_invoked}\n"
+            f"  findings={len(camp.findings)}"
+        )
+        return {
+            "ok": True,
+            "intent": "redteam",
+            "reply": reply,
+            "data": {"repo": target, "mode": camp.mode,
+                     "redteam_invoked": camp.redteam_invoked,
+                     "findings": len(camp.findings)},
+        }
+    except Exception as exc:  # noqa: BLE001
+        LOG.exception("redteam failed: %s", exc)
+        return {"ok": False, "intent": "redteam",
+                "reply": f"Red team run failed: {exc}", "data": None}
 
 
 @register(
