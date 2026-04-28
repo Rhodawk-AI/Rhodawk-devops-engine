@@ -29,7 +29,7 @@ RUN apt-get install -y --no-install-recommends \
 
 # Block 3: Ghidra Dependencies
 RUN apt-get install -y --no-install-recommends \
-    openjdk-17-jre-headless
+    openjdk-21-jdk-headless
 
 # Block 4: Nsjail Compilation Dependencies
 RUN apt-get install -y --no-install-recommends \
