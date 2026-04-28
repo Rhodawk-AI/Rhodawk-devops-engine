@@ -16,21 +16,31 @@ ENV DEBIAN_FRONTEND=noninteractive \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy
 
-# ─── OS Dependencies & Tooling ────────────────────────────────────>
-RUN apt-get update --fix-missing && apt-get install -y --no-install-recommends \
-        git curl wget gnupg ca-certificates build-essential unzip xz-utils \
-        nodejs \
-        # AFL++ for Gap 2 
-        afl++ clang lld llvm \
-        # Ghidra deps for Gap 4
-        openjdk-17-jre-headless \
-        # Browser / OS deps
-        xvfb libgtk-3-0 libdbus-glib-1-2 libxt6 libasound2 \
-        libx11-xcb1 libxcomposite1 libxcursor1 libxdamage1 libxfixes3 \
-        libxi6 libxrandr2 libxss1 libxtst6 libnss3 libpango-1.0-0 \
-        libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libgbm1 \
-        # Nsjail compile deps
-        autoconf bison flex libprotobuf-dev libnl-route-3-dev libtool pkg-config protobuf-compiler \
+# ─── OS Dependencies & Tooling (SEGMENTED FOR DEBUGGING) ──────────>
+RUN apt-get update --fix-missing
+
+# Block 1: Core Build Tools
+RUN apt-get install -y --no-install-recommends \
+    git curl wget gnupg ca-certificates build-essential unzip xz-utils nodejs
+
+# Block 2: AFL++ and LLVM
+RUN apt-get install -y --no-install-recommends \
+    afl++ clang lld llvm
+
+# Block 3: Ghidra Dependencies
+RUN apt-get install -y --no-install-recommends \
+    openjdk-17-jre-headless
+
+# Block 4: Nsjail Compilation Dependencies
+RUN apt-get install -y --no-install-recommends \
+    autoconf bison flex libprotobuf-dev libnl-route-3-dev libtool pkg-config protobuf-compiler
+
+# Block 5: Headless Browser OS Dependencies
+RUN apt-get install -y --no-install-recommends \
+    xvfb libgtk-3-0 libdbus-glib-1-2 libxt6 libasound2 \
+    libx11-xcb1 libxcomposite1 libxcursor1 libxdamage1 libxfixes3 \
+    libxi6 libxrandr2 libxss1 libxtst6 libnss3 libpango-1.0-0 \
+    libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libgbm1 \
     && rm -rf /var/lib/apt/lists/*
 
 # ─── Gap 3: Nsjail (Exploit Validator Sandbox) ────────────────────>
@@ -58,21 +68,15 @@ RUN curl -fsSL -o /tmp/g.zip https://github.com/NationalSecurityAgency/ghidra/re
 # ─── Python Dependencies ──────────────────────────────────────────>
 WORKDIR /opt/rhodawk
 
-# Install UV for lightning-fast python package resolution
 RUN pip install --no-cache-dir uv
-
-# Copy requirements and install
 COPY requirements.txt .
 RUN uv pip install --system --no-cache -r requirements.txt
 
 # ─── Gap 6: Semantic Embedder Pre-warm ────────────────────────────>
-# This prevents a massive cold-start delay on first run
 RUN python3 -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('nomic-ai/nomic-embed-code', trust_remote_code=True)"
 
 # ─── Copy Application Code ────────────────────────────────────────>
 COPY . .
-
-# Copy OpenClaude built bundle from stage 1
 COPY --from=openclaude-builder /openclaude/dist/cli.mjs /opt/rhodawk/vendor/openclaude/dist/cli.mjs
 
 # ─── Final Environment Variables ──────────────────────────────────>
@@ -87,5 +91,4 @@ ENV CODEQL_BIN=/opt/codeql/codeql \
     RHODAWK_EMBEDDING_DIM=768 \
     RHODAWK_EMBEDDING_DEVICE=cpu
 
-# ─── Entrypoint ───────────────────────────────────────────────────>
-CMD ["python3", -u "app.py"]
+CMD ["python3", "app.py"]
