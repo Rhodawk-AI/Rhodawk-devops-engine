@@ -30,14 +30,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import threading
 import time
+import traceback
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import Any, Callable, Optional
 
 import requests
+
+# Module-level logger so tool-dispatch failures emit a real, greppable
+# [ERROR] line with the full Python traceback, instead of being silently
+# collapsed into a generic "internal error" string handed back to the LLM.
+LOG = logging.getLogger("hermes_orchestrator")
 
 # ── Gap 6: semantic embedder for context retrieval ───────────────────────
 # `_embed_fn` is the canonical sentence-encoder entry point. Pulled in at
@@ -864,7 +871,34 @@ def _dispatch_tool(tool_name: str, args: dict, session: HermesSession) -> dict:
     try:
         result = tool.run(**args)
     except Exception as e:
-        result = {"error": str(e)}
+        # Surface the full traceback to the operator console so silent
+        # tool failures stop being a black box. Previously we returned a
+        # bare ``str(e)`` to the LLM and printed nothing, which is what
+        # produced the "tool encountered an internal error" symptom — the
+        # LLM had nothing actionable to fall back on and the operator had
+        # no signal to debug from.
+        tb = traceback.format_exc()
+        LOG.error(
+            "[ERROR] hermes tool %r raised %s: %s\nargs=%r\n%s",
+            tool_name, type(e).__name__, e, args, tb,
+        )
+        # Also emit through the in-process Hermes log buffer so the
+        # Telegram /diagnostic and dashboard surfaces both see it.
+        try:
+            hermes_log(
+                f"[ERROR] tool {tool_name} raised {type(e).__name__}: {e}",
+                "ERROR",
+            )
+            for line in tb.rstrip().splitlines():
+                hermes_log(line, "ERROR")
+        except Exception:  # noqa: BLE001
+            # Logging must never mask the original failure.
+            pass
+        result = {
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "traceback": tb,
+        }
     elapsed = round(time.time() - start, 2)
     session.tool_call_log.append({
         "tool": tool_name, "args": args,
