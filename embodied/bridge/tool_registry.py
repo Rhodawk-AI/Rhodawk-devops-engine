@@ -89,8 +89,22 @@ class ToolRegistry:
             result = tool.handler(**(args or {}))
             return {"ok": True, "result": _to_json(result)}
         except Exception as exc:  # noqa: BLE001
-            LOG.exception("EmbodiedTool %s raised: %s", name, exc)
-            return {"ok": False, "error": "tool_exception", "exception": repr(exc)}
+            # Surface the full traceback to both the log AND the caller
+            # (HERMES, MCP transport, etc.) so silent tool failures stop
+            # being misclassified as empty-result successes.
+            import traceback as _tb
+            tb_text = _tb.format_exc()
+            LOG.error(
+                "[ERROR] EmbodiedTool %s raised %s: %s\n%s",
+                name, type(exc).__name__, exc, tb_text,
+            )
+            return {
+                "ok": False,
+                "error": "tool_exception",
+                "exception": repr(exc),
+                "exception_type": type(exc).__name__,
+                "traceback": tb_text,
+            }
 
 
 # ---------------------------------------------------------------------------

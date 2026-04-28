@@ -325,6 +325,14 @@ class OSSGuardian:
         except Exception as exc:  # noqa: BLE001
             LOG.exception("OSSGuardian crashed on %s: %s", repo_url, exc)
             camp.error = str(exc)
+            # Pin the campaign to a documented terminal mode so the
+            # state machine is exhaustive — an un-set mode here would
+            # leave the orchestrator unable to tell setup-time crashes
+            # apart from successful "patching" runs, and could leak into
+            # a red-team trigger upstream. setup_failed is gated below
+            # red team in every consumer.
+            if camp.mode in ("setup", "patching"):
+                camp.mode = "setup_failed"
         return camp
 
     # ── stage: env setup ──────────────────────────────────────────────────

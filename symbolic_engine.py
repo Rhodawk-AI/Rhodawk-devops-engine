@@ -288,7 +288,13 @@ def _ast_analysis(repo_dir: str, target_function: str) -> SymbolicResult:
 
 
 def _semgrep_symbolic(repo_dir: str) -> dict:
-    """Run semgrep with security-focused rules for additional coverage."""
+    """Run semgrep with security-focused rules for additional coverage.
+
+    Failures are surfaced (stderr + exception class + traceback) instead
+    of being silently swallowed — a quietly-broken semgrep was returning
+    {findings: 0} which the orchestrator treated as a clean run.
+    """
+    import traceback as _tb
     try:
         result = subprocess.run(
             ["semgrep", "--config", "p/security-audit", "--json",
@@ -302,9 +308,42 @@ def _semgrep_symbolic(repo_dir: str) -> dict:
                 "results": data.get("results", [])[:10],
                 "tool": "semgrep_security_audit",
             }
-    except Exception as e:
-        pass
-    return {"findings": 0, "results": [], "tool": "semgrep_unavailable"}
+        # Non-(0,1) exit code → emit diagnostics rather than discarding.
+        print(
+            f"[SYMBOLIC][ERROR] semgrep exited rc={result.returncode}; "
+            f"stderr={(result.stderr or '')[:400]!r}",
+            flush=True,
+        )
+        return {
+            "findings": 0,
+            "results": [],
+            "tool": "semgrep_failed",
+            "returncode": result.returncode,
+            "stderr": (result.stderr or "")[:1000],
+        }
+    except FileNotFoundError as e:
+        print(f"[SYMBOLIC][WARN] semgrep binary not installed: {e}", flush=True)
+        return {"findings": 0, "results": [], "tool": "semgrep_unavailable",
+                "reason": "binary_not_found"}
+    except subprocess.TimeoutExpired as e:
+        print(f"[SYMBOLIC][ERROR] semgrep timed out after {e.timeout}s",
+              flush=True)
+        return {"findings": 0, "results": [], "tool": "semgrep_timeout",
+                "timeout_s": e.timeout}
+    except Exception as e:  # noqa: BLE001
+        print(
+            f"[SYMBOLIC][ERROR] semgrep crashed ({type(e).__name__}): {e}\n"
+            f"{_tb.format_exc()}",
+            flush=True,
+        )
+        return {
+            "findings": 0,
+            "results": [],
+            "tool": "semgrep_crashed",
+            "exception_type": type(e).__name__,
+            "exception": repr(e),
+            "traceback": _tb.format_exc(),
+        }
 
 
 def run_symbolic_analysis(repo_dir: str, target_function: str = None) -> dict:

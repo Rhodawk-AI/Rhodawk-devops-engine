@@ -275,10 +275,23 @@ def _run_python_atheris(harness_code: str, duration_s: int) -> list[CrashRecord]
                         is_unique=True,
                         reproducer_path=crash_path,
                     ))
-                except Exception:
-                    pass
+                except Exception as crash_exc:  # noqa: BLE001
+                    import traceback as _tb
+                    print(
+                        f"[FUZZ][ERROR] failed to read crash artifact "
+                        f"{crash_path}: {type(crash_exc).__name__}: "
+                        f"{crash_exc}\n{_tb.format_exc()}",
+                        flush=True,
+                    )
 
     except Exception as e:
+        import traceback as _tb
+        tb_text = _tb.format_exc()
+        print(
+            f"[FUZZ][ERROR] libfuzzer harness crashed "
+            f"({type(e).__name__}): {e}\n{tb_text}",
+            flush=True,
+        )
         crashes.append(CrashRecord(
             crash_id="setup_error",
             target="python_harness",

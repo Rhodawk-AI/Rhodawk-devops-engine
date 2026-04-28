@@ -117,8 +117,27 @@ def _git_log(repo_dir: str, n: int = 50) -> list[dict]:
                 })
             i += 1
         return entries
-    except Exception as e:
-        print(f"[CAD] git log failed: {e}")
+    except FileNotFoundError as e:
+        print(f"[CAD][ERROR] git binary not found: {e}", flush=True)
+        return []
+    except subprocess.TimeoutExpired as e:
+        print(f"[CAD][ERROR] git log timed out after {e.timeout}s", flush=True)
+        return []
+    except Exception as e:  # noqa: BLE001
+        import traceback as _tb
+        # Surface stderr from the underlying git invocation when we have it,
+        # plus the full traceback — silent {[]} returns previously hid
+        # repos with corrupt .git/, missing branches, or perm errors.
+        stderr_blob = ""
+        try:
+            stderr_blob = (result.stderr or "")[:400]  # type: ignore[name-defined]
+        except Exception:  # noqa: BLE001
+            pass
+        print(
+            f"[CAD][ERROR] git log failed ({type(e).__name__}): {e}; "
+            f"stderr={stderr_blob!r}\n{_tb.format_exc()}",
+            flush=True,
+        )
         return []
 
 
@@ -129,8 +148,23 @@ def _get_commit_diff(repo_dir: str, sha: str) -> str:
             ["git", "show", "--unified=3", "--no-color", sha],
             cwd=repo_dir, capture_output=True, text=True, timeout=15,
         )
+        if result.returncode != 0:
+            print(
+                f"[CAD][WARN] git show {sha[:8]} rc={result.returncode}; "
+                f"stderr={(result.stderr or '')[:300]!r}",
+                flush=True,
+            )
         return result.stdout[:5000]
-    except Exception:
+    except subprocess.TimeoutExpired:
+        print(f"[CAD][ERROR] git show {sha[:8]} timed out", flush=True)
+        return ""
+    except Exception as e:  # noqa: BLE001
+        import traceback as _tb
+        print(
+            f"[CAD][ERROR] git show {sha[:8]} crashed "
+            f"({type(e).__name__}): {e}\n{_tb.format_exc()}",
+            flush=True,
+        )
         return ""
 
 
