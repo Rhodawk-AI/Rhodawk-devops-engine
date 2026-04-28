@@ -90,5 +90,13 @@ ENV CODEQL_BIN=/opt/codeql/codeql \
     RHODAWK_EMBEDDING_MODEL=nomic-ai/nomic-embed-code \
     RHODAWK_EMBEDDING_DIM=768 \
     RHODAWK_EMBEDDING_DEVICE=cpu
+# ─── Compile gRPC Protobufs ───────────────────────────────────────>
+RUN uv pip install --system grpcio-tools \
+ && python3 -m grpc_tools.protoc -I=vendor/openclaude/src/proto \
+    --python_out=openclaude_grpc \
+    --grpc_python_out=openclaude_grpc \
+    vendor/openclaude/src/proto/openclaude.proto \
+ && sed -i 's/import openclaude_pb2/from . import openclaude_pb2/g' openclaude_grpc/openclaude_pb2_grpc.py || true
 
+# ─── Entrypoint ───────────────────────────────────────────────────>
 CMD ["python3", "app.py"]
