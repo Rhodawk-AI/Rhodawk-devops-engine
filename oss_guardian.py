@@ -203,7 +203,7 @@ class OSSGuardian:
         repo_path = ""
         try:
             with _open_sandbox(repo_url) as sbx:
-                repo_path = getattr(sbx, "repo_path", None) or str(sbx)
+                repo_path = str(getattr(sbx, "repo_path", None) or sbx)
                 runtime = _detect_runtime(repo_path)
                 language = getattr(runtime, "language", "unknown")
                 camp.notes.append(f"runtime:{language}")
