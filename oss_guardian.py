@@ -48,8 +48,12 @@ def _open_sandbox(repo_url: str):
 
 
 def _detect_runtime(repo_path: str):
-    from language_runtime import detect_runtime
-    return detect_runtime(repo_path)
+    # language_runtime exposes RuntimeFactory.for_repo as the canonical
+    # auto-detect entry point — there is no module-level detect_runtime.
+    # Using the factory keeps oss_guardian aligned with app.py and the
+    # rest of the engine, which all go through RuntimeFactory.
+    from language_runtime import RuntimeFactory
+    return RuntimeFactory.for_repo(repo_path)
 
 
 def _hermes_attack(repo_path: str, language: str):
