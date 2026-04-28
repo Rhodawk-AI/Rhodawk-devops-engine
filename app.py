@@ -2825,6 +2825,18 @@ if __name__ == "__main__":
         except Exception as _e:  # noqa: BLE001
             print(f"[OPENCLAW] gateway not started: {_e}")
 
+    # ── Async Telegram bot (decoupled polling listener) ───────────────────
+    # The bot lives on its own daemon thread + asyncio loop so the
+    # 14 GB embedding model and gRPC bridges on the main thread can
+    # never block /start ingestion. Opt out with TELEGRAM_BOT=0.
+    if os.getenv("TELEGRAM_BOT", "1") != "0" and os.getenv("TELEGRAM_BOT_TOKEN"):
+        try:
+            import telegram_bot as _tg
+            _tg.start_in_background()
+            print("[TELEGRAM] async polling bot armed")
+        except Exception as _e:  # noqa: BLE001
+            print(f"[TELEGRAM] bot not started: {_e}")
+
     # ── EmbodiedOS Headless Enforcement (Playbook §2) ─────────────────────
     # When EMBODIED_LEGACY_UI=0, completely bypass the demo.launch() Gradio UI
     # and rely on openclaw_gateway + unified_gateway.py to keep the process

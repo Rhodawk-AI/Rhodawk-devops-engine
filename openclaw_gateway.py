@@ -259,6 +259,21 @@ def _help(_: re.Match[str]) -> dict[str, Any]:
     return {"ok": True, "intent": "help", "reply": "\n".join(lines), "data": None}
 
 
+@register(
+    "start",
+    r"^\s*/?start\b",
+    help="/start — readiness ping (verbose-logged in telegram_bot.py)",
+)
+def _start(_: re.Match[str]) -> dict[str, Any]:
+    LOG.info("openclaw cmd /start :: readiness ping")
+    return {
+        "ok": True,
+        "intent": "start",
+        "reply": "I'm DevSecOps ready for my first task",
+        "data": None,
+    }
+
+
 # ── core dispatcher ─────────────────────────────────────────────────────────
 def handle_command(text: str, *, user: str = "operator") -> dict[str, Any]:
     """Match a freeform command to an intent and execute its handler."""
@@ -348,24 +363,33 @@ def create_app():
 
 
 _THREAD: threading.Thread | None = None
+_THREAD_LOCK = threading.Lock()
 
 
 def start_in_background(host: str = "0.0.0.0", port: int = 8765) -> threading.Thread | None:
+    """Spawn the Flask gateway on a daemon thread (idempotent + race-safe).
+
+    Race fix: previously two callers (e.g. app.py boot + a hot-reload)
+    could both observe `_THREAD is None`, both build a Flask app, and
+    both bind to ``port``. The lock guarantees a single live listener
+    per process.
+    """
     global _THREAD
-    if _THREAD and _THREAD.is_alive():
+    with _THREAD_LOCK:
+        if _THREAD and _THREAD.is_alive():
+            return _THREAD
+        app = create_app()
+        if app is None:
+            return None
+        def _run() -> None:
+            try:
+                app.run(host=host, port=port, debug=False, use_reloader=False)
+            except Exception as exc:  # noqa: BLE001
+                LOG.exception("openclaw gateway crashed: %s", exc)
+        _THREAD = threading.Thread(target=_run, name="openclaw-gateway", daemon=True)
+        _THREAD.start()
+        LOG.info("openclaw gateway listening on %s:%d", host, port)
         return _THREAD
-    app = create_app()
-    if app is None:
-        return None
-    def _run() -> None:
-        try:
-            app.run(host=host, port=port, debug=False, use_reloader=False)
-        except Exception as exc:  # noqa: BLE001
-            LOG.exception("openclaw gateway crashed: %s", exc)
-    _THREAD = threading.Thread(target=_run, name="openclaw-gateway", daemon=True)
-    _THREAD.start()
-    LOG.info("openclaw gateway listening on %s:%d", host, port)
-    return _THREAD
 
 
 if __name__ == "__main__":  # pragma: no cover

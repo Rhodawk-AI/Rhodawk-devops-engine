@@ -87,3 +87,15 @@ PyYAML>=6.0
 opentelemetry-sdk>=1.25.0
 opentelemetry-exporter-otlp-proto-grpc>=1.25.0
 langfuse>=2.40.0
+
+# ─── Multi-Tier LLM Manager (DigitalOcean primary, NVIDIA NIM fallback) ──
+# Used by `llm_manager.py` to talk to both providers via their shared
+# OpenAI-compatible chat-completions interface.
+openai>=1.40.0
+python-dotenv>=1.0.0
+
+# ─── Async Telegram bot (decoupled polling listener) ─────────────────────
+# `telegram_bot.py` runs python-telegram-bot v20+ on its own daemon
+# thread + asyncio loop so the 14 GB embedding model and gRPC bridges
+# on the main thread can never block /start ingestion.
+python-telegram-bot>=20.7,<22
