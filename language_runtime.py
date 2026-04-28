@@ -353,7 +353,15 @@ class PythonRuntime(LanguageRuntime):
         # via `python -m venv` (which includes pip) but the bare pip script is absent.
         venv_python = os.path.join(venv_dir, "bin", "python")
 
-        def _install_deps(args: list[str]) -> bool:
+        # Track every install step so a silent pip failure cannot be
+        # misattributed downstream as a "test failure" (the previous
+        # behaviour: skipped install → ImportError on app code → patch
+        # loop tried to "fix" the test file). Setup errors are surfaced
+        # via warnings.warn AND attached to the EnvConfig as
+        # ``setup_warnings`` so OSSGuardian can include them in the report.
+        setup_warnings: list[str] = []
+
+        def _install_deps(args: list[str], label: str) -> bool:
             """Try uv pip install first; fall back to the venv python -m pip on failure."""
             if uv_bin:
                 out, code = self._run(
@@ -364,30 +372,61 @@ class PythonRuntime(LanguageRuntime):
                 out, code = ("uv executable not found", 127)
             if code != 0:
                 import warnings
-                warnings.warn(f"uv pip install failed (exit {code}) — falling back to pip. {out.strip()[:200]}")
-                # FIX-010: use venv_python -m pip instead of a bare pip_bin path —
-                # the `pip` script may be absent in freshly-created stdlib venvs.
-                _, pip_code = self._run(
-                    [venv_python, "-m", "pip", "install", "--quiet"] + args,
+                warnings.warn(
+                    f"[{label}] uv pip install failed (exit {code}) — "
+                    f"falling back to pip. {out.strip()[:200]}"
+                )
+                pip_out, pip_code = self._run(
+                    [venv_python, "-m", "pip", "install"] + args,
                     cwd=repo_dir, timeout=600,
                 )
-                return pip_code == 0
+                if pip_code != 0:
+                    msg = (
+                        f"[{label}] pip install failed (exit {pip_code}): "
+                        f"{(pip_out or '').strip()[:400]}"
+                    )
+                    warnings.warn(msg)
+                    setup_warnings.append(msg)
+                    return False
+                return True
             return True
 
         req_path = os.path.join(repo_dir, "requirements.txt")
         if os.path.exists(req_path):
-            _install_deps(["-r", req_path])
+            ok = _install_deps(["-r", req_path], label="requirements.txt")
+            if not ok:
+                setup_warnings.append(
+                    "requirements.txt install failed — subsequent test "
+                    "ImportErrors are environment issues, NOT real test "
+                    "failures. Patch loop will be skipped on this signal."
+                )
         else:
             pyproject = os.path.join(repo_dir, "pyproject.toml")
             if os.path.exists(pyproject):
-                _install_deps(["-e", ".[dev,test]"])
+                # Try the common dev/test extras first; fall back to
+                # the bare project install if extras don't exist.
+                if not _install_deps(["-e", ".[dev,test]"], label="pyproject[dev,test]"):
+                    if not _install_deps(["-e", ".[test]"], label="pyproject[test]"):
+                        if not _install_deps(["-e", ".[dev]"], label="pyproject[dev]"):
+                            _install_deps(["-e", "."], label="pyproject")
 
+        # Always ensure pytest is available — without this, repos with
+        # no requirements.txt / pyproject.toml would have rc=127 → the
+        # state machine flags them as `framework_missing` even though
+        # the issue is "we never installed pytest". Cheap idempotent op.
         pytest_bin = os.path.join(venv_dir, "bin", "pytest")
-        return EnvConfig(
+        if not os.path.exists(pytest_bin):
+            _install_deps(["pytest"], label="pytest_runner")
+
+        cfg = EnvConfig(
             language="python",
             test_runner_cmd=[pytest_bin],
             env_dir=venv_dir,
         )
+        # Stash warnings for OSSGuardian's report renderer (kept as a
+        # plain attribute so we don't have to touch the EnvConfig schema).
+        cfg.setup_warnings = setup_warnings  # type: ignore[attr-defined]
+        return cfg
 
     def discover_tests(self, repo_dir: str) -> list[str]:
         patterns = [

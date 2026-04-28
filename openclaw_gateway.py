@@ -40,6 +40,7 @@ import logging
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -70,6 +71,46 @@ def register(name: str, pattern: str, *, help: str = "") -> Callable[[Callable],
 
 
 # ── handler implementations ─────────────────────────────────────────────────
+def _campaign_report_dir() -> str:
+    """Where the operator's Markdown narrative reports get written.
+
+    Honors $RHODAWK_REPORTS_DIR for ops/CI overrides; otherwise picks a
+    durable per-host location. ``mkdir -p`` is performed lazily so a
+    misconfigured path surfaces at write-time, not at import-time.
+    """
+    return os.environ.get(
+        "RHODAWK_REPORTS_DIR",
+        os.path.join(os.environ.get("RHODAWK_DATA_DIR", "/tmp/rhodawk"),
+                     "campaign_reports"),
+    )
+
+
+def _persist_campaign_report(camp, intent: str) -> str | None:
+    """Render the markdown narrative and write it to disk; returns the path.
+
+    Failures are non-fatal — if the renderer or filesystem blows up we
+    log it and continue so the operator still gets the inline reply.
+    """
+    try:
+        from oss_guardian import render_campaign_markdown  # late import
+        text = render_campaign_markdown(camp)
+        out_dir = _campaign_report_dir()
+        os.makedirs(out_dir, exist_ok=True)
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "_", camp.repo_url)[:80] or "repo"
+        ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        path = os.path.join(out_dir, f"{intent}_{slug}_{ts}.md")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        try:
+            camp.report_path = path
+        except Exception:  # noqa: BLE001
+            pass
+        return path
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("failed to persist campaign report: %s", exc)
+        return None
+
+
 @register(
     "scan_repo",
     r"^\s*(?:scan(?:\s+repo)?|audit)\s+(?P<target>\S+)",
@@ -83,23 +124,29 @@ def _scan_repo(m: re.Match[str]) -> dict[str, Any]:
     try:
         from oss_guardian import OSSGuardian
         camp = OSSGuardian(redteam_authorized=False).run(target)
-        reply = (
-            f"Scan complete for {target}.\n"
-            f"  mode={camp.mode}\n"
-            f"  test_status={camp.test_status}\n"
-            f"  patch_attempts={camp.patch_attempts}/{__import__('oss_guardian').MAX_PATCH_RETRIES}\n"
-            f"  redteam_invoked={camp.redteam_invoked}\n"
-            f"  findings={len(camp.findings)}"
-        )
+        report_path = _persist_campaign_report(camp, "scan")
+        reply_lines = [
+            f"Scan complete for {target}.",
+            f"  mode={camp.mode}",
+            f"  test_status={camp.test_status}",
+            f"  patch_attempts={camp.patch_attempts}/"
+            f"{__import__('oss_guardian').MAX_PATCH_RETRIES}",
+            f"  redteam_invoked={camp.redteam_invoked}",
+            f"  findings={len(camp.findings)}",
+        ]
+        if report_path:
+            reply_lines.append(f"  report={report_path}")
         return {
             "ok": True,
             "intent": "scan_repo",
-            "reply": reply,
+            "reply": "\n".join(reply_lines),
+            "report_path": report_path,
             "data": {"repo": target, "mode": camp.mode,
                      "test_status": camp.test_status,
                      "patch_attempts": camp.patch_attempts,
                      "redteam_invoked": camp.redteam_invoked,
-                     "findings": len(camp.findings)},
+                     "findings": len(camp.findings),
+                     "report_path": report_path},
         }
     except Exception as exc:  # noqa: BLE001
         LOG.exception("scan_repo failed: %s", exc)
@@ -110,31 +157,48 @@ def _scan_repo(m: re.Match[str]) -> dict[str, Any]:
 @register(
     "redteam",
     r"^\s*/?red[\s_-]?team\s+(?P<target>\S+)",
-    help="redteam <repo-url> — explicit red-team authorization (Condition B)",
+    help="redteam <repo-url> — full pipeline with red-team authorization",
 )
 def _redteam(m: re.Match[str]) -> dict[str, Any]:
-    """Operator-authorized offensive run.
-    Sets ``redteam_authorized=True`` AND ``attack_only=True`` so OSSGuardian
-    skips the Blue Team patch loop and goes straight to Hermes attack mode.
-    This is the ONLY way to get the system into red team mode without first
-    exhausting the patch loop on a real test failure (Condition A)."""
+    """Operator-authorized full-pipeline run.
+
+    Sets ``redteam_authorized=True`` and runs the COMPLETE flow:
+    clone → setup → tests → blue-team patch loop → red-team
+    (HERMES) → blue-team zero-day patch. ``attack_only`` is
+    intentionally False — the operator wants the entire chain
+    documented in the Markdown narrative, not just the offensive
+    half. To bypass the patch loop entirely, use the CLI
+    ``oss_guardian --attack-only --redteam ...``.
+    """
     target = m.group("target").strip()
     try:
         from oss_guardian import OSSGuardian
-        camp = OSSGuardian(redteam_authorized=True, attack_only=True).run(target)
-        reply = (
-            f"Red team run authorized for {target}.\n"
-            f"  mode={camp.mode}\n"
-            f"  redteam_invoked={camp.redteam_invoked}\n"
-            f"  findings={len(camp.findings)}"
-        )
+        camp = OSSGuardian(
+            redteam_authorized=True,
+            attack_only=False,
+        ).run(target)
+        report_path = _persist_campaign_report(camp, "redteam")
+        reply_lines = [
+            f"Red team pipeline complete for {target}.",
+            f"  mode={camp.mode}",
+            f"  test_status={camp.test_status}",
+            f"  patch_attempts={camp.patch_attempts}",
+            f"  redteam_invoked={camp.redteam_invoked}",
+            f"  findings={len(camp.findings)}",
+        ]
+        if report_path:
+            reply_lines.append(f"  report={report_path}")
         return {
             "ok": True,
             "intent": "redteam",
-            "reply": reply,
+            "reply": "\n".join(reply_lines),
+            "report_path": report_path,
             "data": {"repo": target, "mode": camp.mode,
+                     "test_status": camp.test_status,
+                     "patch_attempts": camp.patch_attempts,
                      "redteam_invoked": camp.redteam_invoked,
-                     "findings": len(camp.findings)},
+                     "findings": len(camp.findings),
+                     "report_path": report_path},
         }
     except Exception as exc:  # noqa: BLE001
         LOG.exception("redteam failed: %s", exc)

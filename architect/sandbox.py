@@ -52,11 +52,64 @@ def _docker_available() -> bool:
     return shutil.which("docker") is not None
 
 
+_GH_SHORT_RX = __import__("re").compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+
+
+def _normalize_repo_url(target: str) -> str:
+    """Accept the half-dozen ways an operator might type a repo URL.
+
+    - ``owner/repo``                  → ``https://github.com/owner/repo.git``
+    - ``github.com/owner/repo``       → ``https://github.com/owner/repo.git``
+    - ``https://github.com/owner/repo`` (with or without trailing /)
+    - ``https://github.com/owner/repo.git`` → unchanged
+    - local path                      → unchanged (handled by git clone)
+    """
+    t = (target or "").strip().rstrip("/")
+    if not t:
+        return t
+    if t.startswith(("http://", "https://", "git@", "ssh://", "file://")):
+        return t if t.endswith(".git") else t + ".git"
+    if t.startswith("github.com/"):
+        t = "https://" + t
+        return t if t.endswith(".git") else t + ".git"
+    if _GH_SHORT_RX.match(t):
+        return f"https://github.com/{t}.git"
+    return t  # assume local path; git clone will surface a clear error
+
+
+class CloneError(RuntimeError):
+    """Surface git clone failures with the actual stderr the operator needs."""
+
+    def __init__(self, target_url: str, returncode: int, stderr: str):
+        self.target_url = target_url
+        self.returncode = returncode
+        self.stderr = (stderr or "").strip()
+        super().__init__(
+            f"git clone {target_url!r} failed (exit {returncode}): "
+            f"{self.stderr[:400] or '<no stderr>'}"
+        )
+
+
 def _git_clone(target_url: str, dest: Path, depth: int = 1) -> None:
-    subprocess.run(
-        ["git", "clone", "--depth", str(depth), target_url, str(dest)],
-        check=True, timeout=600, capture_output=True,
-    )
+    """Clone the target repo. Surfaces full git stderr on failure so the
+    operator never sees a bare 'returned non-zero exit status 128'.
+    """
+    normalized = _normalize_repo_url(target_url)
+    try:
+        result = subprocess.run(
+            ["git", "clone", "--depth", str(depth), normalized, str(dest)],
+            timeout=600, capture_output=True, text=True,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise CloneError(
+            normalized, -1,
+            f"timed out after {exc.timeout}s while cloning",
+        ) from exc
+    except FileNotFoundError as exc:
+        raise CloneError(normalized, -1, f"git binary not found: {exc}") from exc
+    if result.returncode != 0:
+        raise CloneError(normalized, result.returncode, result.stderr)
+    LOG.info("Cloned %s → %s", normalized, dest)
 
 
 @contextmanager

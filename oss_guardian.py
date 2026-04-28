@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -130,6 +131,27 @@ class OSSCampaign:
     patch_attempts: int = 0
     redteam_invoked: bool = False
     test_status: str = "unknown"
+    # Structured timeline of every milestone — what the markdown
+    # narrative renderer walks to produce the end-to-end story
+    # (clone → setup → discover → run → patch attempt N → red-team
+    # tool calls → findings → patches). Each entry is
+    # {"ts": iso8601, "phase": str, "kind": str, "data": dict}.
+    events: list[dict] = field(default_factory=list)
+    started_at: str = field(
+        default_factory=lambda: time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+    completed_at: str | None = None
+    setup_warnings: list[str] = field(default_factory=list)
+    report_path: str | None = None
+
+    def event(self, phase: str, kind: str, **data: Any) -> None:
+        """Record one structured milestone."""
+        self.events.append({
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "phase": phase,
+            "kind": kind,
+            "data": data,
+        })
 
     def to_json(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -200,24 +222,43 @@ class OSSGuardian:
     # ── public entry ───────────────────────────────────────────────────────
     def run(self, repo_url: str) -> OSSCampaign:
         camp = OSSCampaign(repo_url=repo_url, mode="setup")
+        camp.event("PHASE_1", "campaign_started", repo_url=repo_url,
+                   flags={"attack_only": self.attack_only,
+                          "fix_only": self.fix_only,
+                          "redteam_authorized": self.redteam_authorized})
         repo_path = ""
         try:
             with _open_sandbox(repo_url) as sbx:
                 repo_path = str(getattr(sbx, "repo_path", None) or sbx)
+                camp.event("PHASE_1", "sandbox_opened", repo_path=repo_path,
+                           backend=getattr(sbx, "backend", "unknown"))
                 runtime = _detect_runtime(repo_path)
                 language = getattr(runtime, "language", "unknown")
                 camp.notes.append(f"runtime:{language}")
+                camp.event("PHASE_1", "runtime_detected", language=language)
 
                 # 1) Provision the test environment FIRST so we can tell a
                 #    missing framework apart from a real test failure.
                 env_config = self._safe_setup_env(runtime, repo_path, camp)
                 if env_config is None:
                     camp.mode = "env_failed"
+                    camp.event("PHASE_1", "env_failed",
+                               reason="setup_env returned None")
                     return camp
+                # Hoist any structured setup warnings out of the runtime.
+                sw = getattr(env_config, "setup_warnings", None) or []
+                if sw:
+                    camp.setup_warnings.extend(sw)
+                    camp.event("PHASE_1", "setup_warnings",
+                               warnings=sw[:5], total=len(sw))
 
                 # 2) Run the project's own test suite.
                 test_state = self._run_test_suite(runtime, repo_path, env_config)
                 camp.test_status = test_state["status"]
+                camp.event("PHASE_1", "test_sweep",
+                           status=test_state["status"],
+                           tests_run=test_state.get("tests_run", 0),
+                           failure_count=len(test_state.get("failures") or []))
 
                 # 3) Framework missing → re-install once, retest.
                 if test_state["status"] == "framework_missing":
@@ -333,6 +374,13 @@ class OSSGuardian:
             # red team in every consumer.
             if camp.mode in ("setup", "patching"):
                 camp.mode = "setup_failed"
+        camp.completed_at = time.strftime("%Y-%m-%dT%H:%M:%SZ")
+        camp.event("PHASE_3", "campaign_completed",
+                   mode=camp.mode, test_status=camp.test_status,
+                   findings_count=len(camp.findings),
+                   patch_attempts=camp.patch_attempts,
+                   redteam_invoked=camp.redteam_invoked,
+                   error=camp.error)
         return camp
 
     # ── stage: env setup ──────────────────────────────────────────────────
@@ -427,10 +475,22 @@ class OSSGuardian:
         """
         Up to MAX_PATCH_RETRIES rounds of (request patch ➜ apply ➜ retest).
         Returns True if the suite is green at the end of any round.
+
+        Every milestone is recorded as a structured event so the markdown
+        narrative renderer can tell the operator EXACTLY what happened on
+        each attempt — what failed, what the LLM proposed, what was
+        applied, and what the post-patch test sweep returned.
         """
+        import traceback as _tb
         state = initial_state
+        camp.event("PHASE_1", "patch_loop_started",
+                   max_retries=MAX_PATCH_RETRIES,
+                   initial_failure_count=len(initial_state.get("failures") or []))
         for attempt in range(1, MAX_PATCH_RETRIES + 1):
             camp.patch_attempts = attempt
+            camp.event("PHASE_1", "patch_attempt_start",
+                       attempt=attempt,
+                       failing=[f["path"] for f in (state.get("failures") or [])][:8])
             try:
                 patch = self._request_patch(
                     repo_path=repo_path,
@@ -438,10 +498,17 @@ class OSSGuardian:
                     attempt=attempt,
                 )
             except Exception as exc:  # noqa: BLE001
-                LOG.warning("patch attempt %d: LLM call failed: %s", attempt, exc)
+                tb_text = _tb.format_exc()
+                LOG.warning("patch attempt %d: LLM call failed: %s\n%s",
+                            attempt, exc, tb_text)
                 camp.notes.append(
                     f"patch attempt {attempt}: LLM unavailable — {exc}"
                 )
+                camp.event("PHASE_1", "patch_llm_failed",
+                           attempt=attempt,
+                           exception_type=type(exc).__name__,
+                           exception=repr(exc),
+                           traceback=tb_text)
                 # Without an LLM there is nothing to apply; no point retrying.
                 break
 
@@ -452,33 +519,79 @@ class OSSGuardian:
                     f"patch attempt {attempt}: model returned no files "
                     f"(rationale={rationale!r}) — skipping apply"
                 )
-                # Still re-run tests in case prior attempt's patch needs
-                # a fresh look; otherwise abort on the next iteration.
+                camp.event("PHASE_1", "patch_empty",
+                           attempt=attempt, rationale=rationale)
                 continue
+
+            # Capture the pre-patch contents so the report can show the
+            # actual diff the LLM made — this is the "how did blue team
+            # patch it" detail the operator wants to see.
+            pre_snapshots: dict[str, str] = {}
+            for f in files:
+                rel = self._sanitize_relpath(f["path"], os.path.realpath(repo_path))
+                if rel is None:
+                    continue
+                full = os.path.join(os.path.realpath(repo_path), rel)
+                try:
+                    pre_snapshots[rel] = Path(full).read_text(errors="replace")
+                except OSError:
+                    pre_snapshots[rel] = ""  # new file
+
             applied = self._apply_patch_files(files, repo_path, camp, attempt)
             if not applied:
                 camp.notes.append(
                     f"patch attempt {attempt}: nothing applied (all files "
                     f"rejected); aborting patch loop"
                 )
+                camp.event("PHASE_1", "patch_apply_failed",
+                           attempt=attempt, rationale=rationale)
                 break
+
             camp.notes.append(
                 f"patch attempt {attempt}: applied {applied} file(s) "
                 f"— rationale: {rationale[:200]!r}"
             )
+            # Record the patch with before/after summaries (capped to
+            # keep the JSON event log under control).
+            file_diffs = []
+            for f in files[:6]:
+                rel = self._sanitize_relpath(f["path"], os.path.realpath(repo_path))
+                if rel is None:
+                    continue
+                pre = pre_snapshots.get(rel, "")
+                post = f.get("content", "")
+                file_diffs.append({
+                    "path": rel,
+                    "pre_len": len(pre),
+                    "post_len": len(post),
+                    "pre_head": pre[:600],
+                    "post_head": post[:600],
+                    "pre_was_new": pre == "",
+                })
+            camp.event("PHASE_1", "patch_applied",
+                       attempt=attempt, applied=applied,
+                       rationale=rationale, files=file_diffs)
+
             state = self._run_test_suite(runtime, repo_path, env_config)
             camp.test_status = state["status"]
+            camp.event("PHASE_1", "post_patch_test_sweep",
+                       attempt=attempt, status=state["status"],
+                       tests_run=state.get("tests_run", 0),
+                       failure_count=len(state.get("failures") or []))
             if state["status"] == "passed":
+                camp.event("PHASE_1", "patch_loop_success", attempt=attempt)
                 return True
             if state["status"] == "framework_missing":
-                # The patch broke the env — undo would be ideal but we
-                # don't snapshot. Bail; do not red-team off a broken env.
                 camp.notes.append(
                     f"patch attempt {attempt}: patched code broke the test "
                     f"framework — aborting patch loop"
                 )
+                camp.event("PHASE_1", "patch_broke_framework",
+                           attempt=attempt)
                 return False
             # status == "failed" → loop and try again
+        camp.event("PHASE_1", "patch_loop_exhausted",
+                   attempts=camp.patch_attempts)
         return False
 
     # ── Blue Team patch request ───────────────────────────────────────────
@@ -720,18 +833,48 @@ class OSSGuardian:
         *,
         reason: str,
     ) -> OSSCampaign:
+        import traceback as _tb
         camp.notes.append(f"red team launched (reason={reason})")
         camp.redteam_invoked = True
+        camp.event("PHASE_2", "red_team_started",
+                   reason=reason, language=language)
         camp.mode = "redteam" if camp.mode in ("setup", "tests_passing",
                                                "no_tests") else camp.mode
         try:
             session = _hermes_attack(repo_path, language)
             camp.findings = self._extract_findings(session)
+            # Capture the red-team session metadata so the markdown
+            # narrative can show: how many iterations, which tools were
+            # called in what order, and what each finding looked like.
+            tool_log = list(getattr(session, "tool_call_log", []) or [])
+            camp.event("PHASE_2", "red_team_completed",
+                       session_id=getattr(session, "session_id", "?"),
+                       phase=getattr(getattr(session, "phase", None),
+                                     "value", "?"),
+                       tool_calls=len(tool_log),
+                       tools_used=sorted({
+                           str(c.get("tool") or c.get("name") or "?")
+                           for c in tool_log
+                       }),
+                       findings_count=len(camp.findings))
+            for f in camp.findings:
+                camp.event("PHASE_2", "finding_recorded",
+                           finding_id=f.get("finding_id") or f.get("id") or "?",
+                           title=f.get("title", "?"),
+                           severity=f.get("severity", "?"),
+                           cwe=f.get("cwe_id") or f.get("cwe") or "?",
+                           file_path=f.get("file_path", ""),
+                           ves_score=f.get("ves_score", 0.0),
+                           acts_score=f.get("acts_score", 0.0))
             self._route_findings(camp.findings, camp)
         except Exception as exc:  # noqa: BLE001
+            tb_text = _tb.format_exc()
             camp.notes.append(f"red team crashed: {exc}")
             LOG.exception("red team crashed: %s", exc)
             camp.error = str(exc)
+            camp.event("PHASE_2", "red_team_crashed",
+                       exception_type=type(exc).__name__,
+                       exception=repr(exc), traceback=tb_text)
         return camp
 
     def _extract_findings(self, session) -> list[dict]:
@@ -783,6 +926,267 @@ class OSSGuardian:
                     LOG.warning("embodied_bridge.emit_finding failed: %s", exc)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# End-to-end Markdown narrative renderer
+#
+# The compliance renderer in `report_generator.py` is intentionally
+# limited to CWE/OWASP/SOC2 mappings. The operator wants the full
+# story — every test failure, every patch attempt with diff and
+# rationale, every red-team tool call, every finding with PoC, every
+# blue-team patch. This walks the structured `OSSCampaign.events`
+# log produced above and renders it as a single Telegram-friendly
+# Markdown report.
+# ─────────────────────────────────────────────────────────────────────────────
+def _md_escape(s: str) -> str:
+    return (s or "").replace("`", "\u02cb").replace("\u200b", "")
+
+
+def _md_code_block(text: str, lang: str = "") -> str:
+    """Render a fenced code block, escaping any nested triple-backticks."""
+    body = (text or "").replace("```", "``\u200b`")
+    return f"```{lang}\n{body}\n```"
+
+
+def render_campaign_markdown(camp: OSSCampaign) -> str:
+    """End-to-end story of a campaign, written for the operator on Telegram.
+
+    Walks ``camp.events`` chronologically and renders each phase. Safe to
+    call on partial campaigns (env_failed, patch_exhausted, crashed).
+    """
+    lines: list[str] = []
+    lines.append(f"# Rhodawk Campaign Report — `{_md_escape(camp.repo_url)}`")
+    lines.append("")
+    lines.append(f"- **Started:** `{camp.started_at}`")
+    lines.append(f"- **Completed:** `{camp.completed_at or '(in flight)'}`")
+    lines.append(f"- **Final mode:** `{camp.mode}`")
+    lines.append(f"- **Test status:** `{camp.test_status}`")
+    lines.append(f"- **Patch attempts:** `{camp.patch_attempts}`")
+    lines.append(f"- **Red team invoked:** `{camp.redteam_invoked}`")
+    lines.append(f"- **Findings:** `{len(camp.findings)}`")
+    if camp.error:
+        lines.append(f"- **Error:** `{_md_escape(camp.error)}`")
+    if camp.pr_url:
+        lines.append(f"- **PR:** {camp.pr_url}")
+    lines.append("")
+
+    if camp.setup_warnings:
+        lines.append("## Environment Warnings")
+        for w in camp.setup_warnings[:20]:
+            lines.append(f"- {_md_escape(w)}")
+        lines.append("")
+
+    # ── Phase 1: Blue Team (clone → setup → tests → patch loop) ──
+    p1 = [e for e in camp.events if e.get("phase") == "PHASE_1"]
+    if p1:
+        lines.append("## Phase 1 — Blue Team (Get Tests Green)")
+        lines.append("")
+        for ev in p1:
+            kind = ev.get("kind", "")
+            data = ev.get("data", {}) or {}
+            ts = ev.get("ts", "")
+            if kind == "campaign_started":
+                lines.append(f"- `{ts}` campaign started, flags=`{data.get('flags')}`")
+            elif kind == "sandbox_opened":
+                lines.append(
+                    f"- `{ts}` sandbox opened at `{_md_escape(data.get('repo_path',''))}` "
+                    f"(backend=`{data.get('backend','?')}`)"
+                )
+            elif kind == "runtime_detected":
+                lines.append(f"- `{ts}` runtime detected: **{data.get('language','?')}**")
+            elif kind == "env_failed":
+                lines.append(f"- `{ts}` ❌ environment setup failed — "
+                             f"{_md_escape(data.get('reason',''))}")
+            elif kind == "setup_warnings":
+                lines.append(
+                    f"- `{ts}` ⚠️ {data.get('total',0)} setup warning(s); "
+                    f"first: `{_md_escape((data.get('warnings') or [''])[0])[:160]}`"
+                )
+            elif kind == "test_sweep":
+                lines.append(
+                    f"- `{ts}` initial test sweep → **{data.get('status','?')}** "
+                    f"({data.get('tests_run',0)} run, "
+                    f"{data.get('failure_count',0)} failing)"
+                )
+            elif kind == "patch_loop_started":
+                lines.append("")
+                lines.append(
+                    f"### Patch loop (max {data.get('max_retries')} attempts, "
+                    f"{data.get('initial_failure_count',0)} failing test file(s))"
+                )
+            elif kind == "patch_attempt_start":
+                lines.append("")
+                lines.append(f"#### Attempt {data.get('attempt')} — `{ts}`")
+                failing = data.get("failing") or []
+                if failing:
+                    lines.append("Failing test files:")
+                    for p in failing:
+                        lines.append(f"- `{_md_escape(p)}`")
+            elif kind == "patch_llm_failed":
+                lines.append(
+                    f"- ❌ LLM patch request failed: "
+                    f"`{_md_escape(data.get('exception_type',''))}`: "
+                    f"{_md_escape(data.get('exception',''))}"
+                )
+                tb = data.get("traceback") or ""
+                if tb:
+                    lines.append(_md_code_block(tb[-1200:], "text"))
+            elif kind == "patch_empty":
+                lines.append(
+                    f"- ⚠️ model returned no files. Rationale: "
+                    f"`{_md_escape(data.get('rationale',''))[:280]}`"
+                )
+            elif kind == "patch_apply_failed":
+                lines.append(
+                    f"- ❌ all proposed files were rejected by the safety "
+                    f"sanitizer. Rationale: `{_md_escape(data.get('rationale',''))[:280]}`"
+                )
+            elif kind == "patch_applied":
+                lines.append(
+                    f"- ✅ applied **{data.get('applied',0)}** file(s)"
+                )
+                rationale = data.get("rationale") or ""
+                if rationale:
+                    lines.append("")
+                    lines.append("**Rationale:**")
+                    lines.append("")
+                    lines.append("> " + _md_escape(rationale).replace("\n", "\n> "))
+                    lines.append("")
+                for fd in data.get("files") or []:
+                    label = "new file" if fd.get("pre_was_new") else "modified"
+                    lines.append(
+                        f"- `{_md_escape(fd.get('path',''))}` ({label}, "
+                        f"{fd.get('pre_len',0)}→{fd.get('post_len',0)} chars)"
+                    )
+                    pre = (fd.get("pre_head") or "")
+                    post = (fd.get("post_head") or "")
+                    if pre or post:
+                        lines.append("")
+                        lines.append("Before (head):")
+                        lines.append(_md_code_block(pre or "(empty / new file)", "text"))
+                        lines.append("After (head):")
+                        lines.append(_md_code_block(post or "(empty)", "text"))
+            elif kind == "post_patch_test_sweep":
+                emoji = "✅" if data.get("status") == "passed" else "❌"
+                lines.append(
+                    f"- {emoji} post-patch tests → **{data.get('status','?')}** "
+                    f"({data.get('tests_run',0)} run, "
+                    f"{data.get('failure_count',0)} failing)"
+                )
+            elif kind == "patch_broke_framework":
+                lines.append(
+                    f"- ❌ patch broke the test framework — aborting loop"
+                )
+            elif kind == "patch_loop_success":
+                lines.append(
+                    f"- 🎉 **patch loop succeeded** on attempt "
+                    f"{data.get('attempt')}"
+                )
+            elif kind == "patch_loop_exhausted":
+                lines.append(
+                    f"- ❌ patch loop exhausted after "
+                    f"{data.get('attempts')} attempt(s)"
+                )
+        lines.append("")
+
+    # ── Phase 2: Red Team (HERMES) ──
+    p2 = [e for e in camp.events if e.get("phase") == "PHASE_2"]
+    if p2:
+        lines.append("## Phase 2 — Red Team (HERMES Adversarial Sweep)")
+        lines.append("")
+        for ev in p2:
+            kind = ev.get("kind", "")
+            data = ev.get("data", {}) or {}
+            ts = ev.get("ts", "")
+            if kind == "red_team_started":
+                lines.append(
+                    f"- `{ts}` red team launched (reason=`{data.get('reason')}`, "
+                    f"language=`{data.get('language')}`)"
+                )
+            elif kind == "red_team_completed":
+                lines.append(
+                    f"- `{ts}` red team complete — session "
+                    f"`{data.get('session_id','?')}`, phase `{data.get('phase','?')}`, "
+                    f"**{data.get('tool_calls',0)}** tool call(s), "
+                    f"**{data.get('findings_count',0)}** finding(s)"
+                )
+                tools = data.get("tools_used") or []
+                if tools:
+                    lines.append(
+                        "- Tools exercised: " + ", ".join(
+                            f"`{_md_escape(t)}`" for t in tools
+                        )
+                    )
+            elif kind == "red_team_crashed":
+                lines.append(
+                    f"- ❌ red team crashed: "
+                    f"`{_md_escape(data.get('exception_type',''))}`: "
+                    f"{_md_escape(data.get('exception',''))}"
+                )
+                tb = data.get("traceback") or ""
+                if tb:
+                    lines.append(_md_code_block(tb[-1200:], "text"))
+            elif kind == "finding_recorded":
+                lines.append("")
+                lines.append(
+                    f"### Finding `{_md_escape(str(data.get('finding_id','?')))}` — "
+                    f"{_md_escape(str(data.get('title','(untitled)')))}"
+                )
+                lines.append(
+                    f"- **Severity:** `{data.get('severity','?')}`  "
+                    f"**CWE:** `{data.get('cwe','?')}`  "
+                    f"**VES:** `{data.get('ves_score',0):.2f}`  "
+                    f"**ACTS:** `{data.get('acts_score',0):.2f}`"
+                )
+                fp = data.get("file_path") or ""
+                if fp:
+                    lines.append(f"- **Location:** `{_md_escape(fp)}`")
+        lines.append("")
+
+    # ── Findings detail (PoC + remediation when present) ──
+    if camp.findings:
+        lines.append("## Findings Detail")
+        lines.append("")
+        for f in camp.findings:
+            fid = f.get("finding_id") or f.get("id") or "?"
+            title = f.get("title") or f.get("description") or "(untitled)"
+            lines.append(f"### `{_md_escape(str(fid))}` — {_md_escape(str(title))}")
+            sev = f.get("severity", "?")
+            cwe = f.get("cwe_id") or f.get("cwe") or "?"
+            lines.append(f"- **Severity:** `{sev}`  **CWE:** `{cwe}`")
+            fp = f.get("file_path") or ""
+            ln = f.get("line_number") or f.get("line") or ""
+            if fp:
+                loc = f"`{_md_escape(fp)}`" + (f":`{ln}`" if ln else "")
+                lines.append(f"- **Location:** {loc}")
+            desc = f.get("description") or ""
+            if desc and desc != title:
+                lines.append("")
+                lines.append("**Description:**")
+                lines.append("")
+                lines.append("> " + _md_escape(desc).replace("\n", "\n> "))
+            poc = f.get("poc") or f.get("proof_of_concept") or ""
+            if poc:
+                lines.append("")
+                lines.append("**Proof of concept:**")
+                lines.append(_md_code_block(str(poc)[:2000], "text"))
+            rem = f.get("remediation") or f.get("recommendation") or ""
+            if rem:
+                lines.append("")
+                lines.append("**Remediation:**")
+                lines.append("")
+                lines.append("> " + _md_escape(str(rem)).replace("\n", "\n> "))
+            lines.append("")
+
+    # ── Notes (chronological) ──
+    if camp.notes:
+        lines.append("## Operator Notes")
+        for n in camp.notes:
+            lines.append(f"- {_md_escape(n)}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="oss_guardian")
     ap.add_argument("--repo", required=True, help="GitHub repo URL or local path")
@@ -793,6 +1197,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--redteam", action="store_true",
                     help="grant red-team authorization (Condition B)")
     ap.add_argument("--out", help="Write campaign JSON to this path")
+    ap.add_argument("--md-out", help="Write the Markdown narrative to this path")
     args = ap.parse_args(argv)
 
     g = OSSGuardian(
@@ -806,6 +1211,8 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.out).write_text(json.dumps(js, indent=2))
     else:
         print(json.dumps(js, indent=2))
+    if args.md_out:
+        Path(args.md_out).write_text(render_campaign_markdown(camp))
     return 0 if not camp.error else 1
 
 
